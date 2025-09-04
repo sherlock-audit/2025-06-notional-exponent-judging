@@ -3,7 +3,7 @@
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/73 
 
 ## Found by 
-KungFuPanda, Ragnarok, xiaoming90
+0xBoraichoT, KungFuPanda, Ragnarok, talfao
 
 - https://github.com/notional-finance/leveraged-vaults/blob/7e0abc3e118db0abb20c7521c6f53f1762fdf562/contracts/trading/adapters/UniV3Adapter.sol#L60-L72
 
@@ -596,77 +596,449 @@ The "before balance" state accounting hould be captured **after** the `_preStaki
     
 ```
 
-# Issue H-2: Double Withdrawal Attack via Reentrant Calls During Yield Token Redemption 
+# Issue H-2: Attacker can drain the entire suppliers on Morpho market by inflating collateral price 
 
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/285 
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/214 
 
 ## Found by 
-0xBoraichoT
+mstpr-brainbot
 
 ### Summary
 
-When a user redeems their collateral, they have two options:
+When `initiateWithdraw()` is called, the user’s collateral in Morpho (i.e., their shares) is **not burned**, but the underlying LP tokens are used to initiate a withdrawal request. At the same time, the **`effectiveSupply()` is decreased** due to the shares being escrowed.
 
-1. **Initiate a withdrawal** via the **Withdraw Request Manager**, making them eligible to withdraw their funds after a predefined period.
-2. **Swap their yield tokens for the asset token**, effectively exiting their position immediately.
+This means the user can **donate yield tokens to the strategy** and artificially **inflate the collateral price on Morpho**, while their original deposit remains safely **secured in the withdrawal process** untouched and retrievable.
 
-However, only one of these two options should be allowed per position. If both are executed, a critical invariant is violated.
+### Root Cause
 
-Currently, there is an exploit that allows a user to redeem their tokens and, during the swap process, re-enter the system to initiate a withdrawal request. This results in **two separate withdrawal claims** on the same position.
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L280-L307](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L280-L307)
 
-This behaviour **breaks the internal accounting of the contract** and can lead to a situation where earlier depositors are unable to withdraw their capital, as the system's liabilities exceed its actual assets.
+We can see that when `initiateWithdraw()` is called, the user's assets are registered as a withdrawal request in the `WithdrawRequestManager`, and `s_escrowedShares` is increased.
+
+Since the shares are not burned, `totalSupply()` remains the same before and after the `initiateWithdraw` call. However, because `escrowedShares` increases, the `effectiveSupply()` becomes smaller:
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L149-L151](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L149-L151)
+
+If the user holds a significant amount of shares, they can initiate a withdrawal, drastically reducing the `effectiveSupply()`. While the minimum `effectiveSupply()` is bounded by `VIRTUAL_SHARES` (set to 1e6), this still opens up a vulnerability.
+
+The next step is to look at how `price()` is calculated in the YieldStrategy (Shares) contract. When users borrow in Morpho, the Morpho oracle (which is the YieldStrategy contract) calls `price()` to determine the value of 1 collateral token in terms of the loan token:
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L118-L120](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L118-L120)
+
+Since `Morpho.borrow()` can be called directly without going through the LendingRouter, the transient variables are not used. Therefore, the overridden `convertToAssets()` method that depends on transient state is skipped, and the base `super.convertToAssets()` is used instead:
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/single-sided-lp/AbstractSingleSidedLP.sol#L300-L303](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/single-sided-lp/AbstractSingleSidedLP.sol#L300-L303)
+
+Now, the critical part is how `convertToAssets()` is calculated:
+
+```solidity
+function convertToAssets(uint256 shares) public view virtual override returns (uint256) {
+    uint256 yieldTokens = convertSharesToYieldToken(shares);
+    return (yieldTokens * convertYieldTokenToAsset() * (10 ** _assetDecimals)) /
+        (10 ** (_yieldTokenDecimals + DEFAULT_DECIMALS));
+}
+
+function convertSharesToYieldToken(uint256 shares) public view override returns (uint256) {
+    return (shares * (_yieldTokenBalance() - feesAccrued() + VIRTUAL_YIELD_TOKENS)) / effectiveSupply();
+}
+
+function convertYieldTokenToShares(uint256 yieldTokens) public view returns (uint256) {
+    return (yieldTokens * effectiveSupply()) / (_yieldTokenBalance() - feesAccrued() + VIRTUAL_YIELD_TOKENS);
+}
+```
+
+If an attacker donates, say, `1e18` of the yield token to the contract, then the `convertSharesToYieldToken()` for `1e24` shares would compute as:
+
+$$
+\frac{1e24 \cdot (1e18 - \text{fees} + 1e6)}{1e6} \approx \text{HUGE value — ~1e36 precision}
+$$
+
+Given that `convertYieldTokenToAsset()` always returns `1e18` (i.e., DEFAULT\_PRECISION), the final `convertToAssets()` result becomes:
+
+$$
+1e36 \cdot 1e18 \cdot 1e18 / 1e36 = 1e36
+$$
+
+This is extremely large.
+
+Since Morpho calculates `maxBorrow = collateral * price() * LTV / 1e36`, and:
+
+* the collateral is on the order of `1e24` (e.g., shares)
+* the `price()` returns `1e36`
+
+the result is:
+
+$$
+\frac{1e24 \cdot 1e36}{1e36} = 1e24
+$$
+
+which means the user can borrow **up to 1e24 units** of the loan token — essentially **draining the entire USDC market** if the loan token uses 6 decimals.
+
+Crucially, the attacker only loses the `1e18` donation of the yield token — which inflated the `price()` — and they can still finalize their withdrawal request and reclaim their original shares.
+
+
+### Internal Pre-conditions
+
+1. User has significant share of the YieldStrategy such that withdrawing all and donating would increase the rate
+
+### External Pre-conditions
+
+None needed
+
+### Attack Path
+
+1. initiateWithdraw() on YieldStrategy
+2. donate some yieldToken to YieldStrategy
+3. Borrow the entire YieldStrategy/asset morpho market
+4. Finalize the withdrawal request, get back the collaterals
+
+### Impact
+
+All supplied funds to morpho market will be lost. 
+
+
+### PoC
+
+```solidity
+// forge test --match-test test_Drain_MorphoSuppliers_ByInflationDonation -vv
+    function test_Drain_MorphoSuppliers_ByInflationDonation() public {
+        vm.skip(address(managers[stakeTokenIndex]) == address(0));
+
+        console.log("Asset is", IERC20Metadata(address(asset)).symbol());
+
+        address tapir = address(69);
+        deal(address(asset), tapir, defaultDeposit); 
+        _enterPosition(tapir, defaultDeposit, 0);
+        uint256 balanceBefore = lendingRouter.balanceOfCollateral(tapir, address(y));
+
+        console.log("Effective supply before initiate withdraw: ", y.effectiveSupply());
+        console.log("Price before initiate withdraw: ", y.price());
+
+        MarketParams memory marketParams = MorphoLendingRouter(address(lendingRouter)).marketParams(address(y));
+        Position memory position = MORPHO.position(Id.wrap(keccak256(abi.encode(marketParams))), tapir);
+        uint maxBorrow = position.collateral * y.price() / 1e36;
+        console.log("Max borrow is: ", maxBorrow);
+
+        vm.startPrank(tapir);
+        lendingRouter.initiateWithdraw(tapir, address(y), getWithdrawRequestData(tapir, balanceBefore));
+
+        position = MORPHO.position(Id.wrap(keccak256(abi.encode(marketParams))), tapir);
+        maxBorrow = position.collateral * y.price() / 1e36;
+        console.log("Max borrow after initiate withdraw: ", maxBorrow);
+
+        console.log("Effective supply after initiate withdraw: ", y.effectiveSupply());
+        console.log("Price after initiate withdraw: ", y.price());
+
+        deal(address(y.yieldToken()), tapir, 1e18);
+        console.log("Yield token of the vault: ", IERC20Metadata(address(y.yieldToken())).symbol());
+        IERC20(y.yieldToken()).transfer(address(y), 1e18);
+
+        position = MORPHO.position(Id.wrap(keccak256(abi.encode(marketParams))), tapir);
+        maxBorrow = position.collateral * y.price() / 1e36;
+        console.log("Max borrow after donation: ", maxBorrow);
+
+        console.log("Effective supply after donation: ", y.effectiveSupply());
+        console.log("Price after donation: ", y.price());
+
+        Id idx = Id.wrap(keccak256(abi.encode(marketParams)));
+        Market memory market = MORPHO.market(idx);
+        console.log("Total supplied", market.totalSupplyAssets);
+        console.log("Total borrowed", market.totalBorrowAssets);
+
+        uint256 borrowable = market.totalSupplyAssets - market.totalBorrowAssets;
+        console.log("Borrowable is", borrowable);
+
+        MORPHO.borrow(marketParams, borrowable, 0, tapir, tapir);
+        console.log("Effective supply after borrow: ", y.effectiveSupply());
+
+        position = MORPHO.position(idx, tapir);
+        console.log("collateral", position.collateral);
+        console.log("borrowShares", position.borrowShares);
+
+        maxBorrow = position.collateral * y.price() / 1e36;
+        uint canBorrow = maxBorrow - position.borrowShares;
+        console.log("Can borrow is", canBorrow); // STILL EXTREMELY HIGH! 
+    }
+```
+
+Logs:
+Ran 1 test for tests/TestSingleSidedLPStrategyImpl.sol:Test_LP_Curve_sDAI_sUSDe
+[PASS] test_Drain_MorphoSuppliers_ByInflationDonation() (gas: 2739684)
+Logs:
+  Asset is USDC
+  Effective supply before initiate withdraw:  8724580706403393214704000000
+  Price before initiate withdraw:  1145196000000000000
+  Max borrow is:  9991354926
+  Max borrow after initiate withdraw:  9991354926
+  Effective supply after initiate withdraw:  1000000
+  Price after initiate withdraw:  1145196000000000000
+  Yield token of the vault:  MtEthena-gauge
+  Max borrow after donation:  9991362815231220073495623667
+  Effective supply after donation:  1000000
+  Price after donation:  1145196904178796121145196000000000000 // HUGE
+  Total supplied 500000000000
+  Total borrowed 0
+  Borrowable is 500000000000
+  Effective supply after borrow:  1000000
+  collateral 8724580706403393214703000000
+  borrowShares 500000000000000000
+  Can borrow is 9991362814731220073495623667
+
+### Mitigation
+
+tbd
+
+# Issue H-3: `DineroWithdrawRequestManager` vulnerable to token overwithdrawal via batch ID overlap 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/297 
+
+## Found by 
+0xc0ffEE, Atharv, Ledger\_Patrol, Ragnarok, Schnilch, X0sauce, aman, hgrano, seeques, xiaoming90
+
+### Summary
+
+Some users may profit while others incur losses because the `DineroWithdrawRequestManager` contract does not track the balance of each `upxETH` token per withdrawal request, even though a single `upxETH` token may be associated with multiple requests.
+
+### Root Cause
+
+When a user initiates a withdrawal request through `DineroWithdrawRequestManager`, the contract executes the `_initiateWithdrawImpl()` function. This function captures `PirexETH.batchId()` before and after calling `PirexETH::initiateRedemption()`:
+
+[DineroWithdrawRequestManager::_initiateWithdrawImpl()](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/withdraws/Dinero.sol#L17) function:
+```solidity
+function _initiateWithdrawImpl(
+    address /* account */,
+    uint256 amountToWithdraw,
+    bytes calldata /* data */
+) override internal returns (uint256 requestId) {
+      ...
+=>    uint256 initialBatchId = PirexETH.batchId();
+      pxETH.approve(address(PirexETH), amountToWithdraw);
+      PirexETH.initiateRedemption(amountToWithdraw, address(this), false);
+=>    uint256 finalBatchId = PirexETH.batchId();
+      uint256 nonce = ++s_batchNonce;
+
+=>    return nonce << 240 | initialBatchId << 120 | finalBatchId;
+  }
+```
+
+When the user later finalizes the withdrawal via `_finalizeWithdrawImpl()`, the contract attempts to redeem all `upxETH` tokens within the range `[initialBatchId, finalBatchId]`:
+
+```solidity
+function _finalizeWithdrawImpl(
+    address /* account */,
+    uint256 requestId
+) internal override returns (uint256 tokensClaimed, bool finalized) {
+    finalized = canFinalizeWithdrawRequest(requestId);
+
+    if (finalized) {
+        (uint256 initialBatchId, uint256 finalBatchId) = _decodeBatchIds(requestId);
+
+=>      for (uint256 i = initialBatchId; i <= finalBatchId; i++) {
+=>          uint256 assets = upxETH.balanceOf(address(this), i);
+            if (assets == 0) continue;
+            PirexETH.redeemWithUpxEth(i, assets, address(this));
+            tokensClaimed += assets;
+        }
+    }
+
+    WETH.deposit{value: tokensClaimed}();
+}
+```
+
+After this, `upxETH.balanceOf(address(this), i)` for all `i` in the range `[initialBatchId, finalBatchId]` becomes 0.
+
+On the other hand, `initialBatchId` and `finalBatchId` may overlap across multiple withdrawal requests due to the logic inside `PirexETH::initiateRedemption()`, which internally calls `PirexEthValidators::_initiateRedemption()`:
+
+```solidity
+function _initiateRedemption(
+    uint256 _pxEthAmount,
+    address _receiver,
+    bool _shouldTriggerValidatorExit
+) internal {
+    pendingWithdrawal += _pxEthAmount;
+
+    while (pendingWithdrawal / DEPOSIT_SIZE != 0) {
+        uint256 _allocationPossible = DEPOSIT_SIZE + _pxEthAmount - pendingWithdrawal;
+
+=>      upxEth.mint(_receiver, batchId, _allocationPossible, "");
+        ...
+        batchIdToValidator[batchId++] = _pubKey;
+        status[_pubKey] = DataTypes.ValidatorStatus.Withdrawable;
+    }
+    ...
+    if (_pxEthAmount > 0) {
+=>      upxEth.mint(_receiver, batchId, _pxEthAmount, "");
+    }
+}
+```
+
+This can lead to some users benefiting at the expense of others. Consider the following scenario:
+
+1. User A initiates a withdrawal request, associated with `upxETH` token IDs 1 and 2.
+2. User B then initiates a withdrawal request, associated with token IDs 2 and 3.
+3. User A finalizes their request and redeems all ETH from token IDs 1 and 2, even though ID 2 is also tied to User B's request. User A withdraws more than intended.
+4. When User B finalizes their request, the balance of token ID 2 is already 0. Thus, they only receive the ETH from token ID 3.
+
+A malicious user can exploit this behavior by front-running another user’s withdrawal request, intentionally causing batch ID overlaps and withdrawing more tokens than intended.
+
+### Impact
+
+A malicious user can:
+
+* Withdraw more tokens than they should by front-running others.
+* Cause financial loss to other users.
+
+### Mitigation
+
+Update the `DineroWithdrawRequestManager` contract to track `upxETH` balances per withdrawal request:
+
+Add state variables:
+
+```solidity
+mapping(uint256 requestId => mapping(uint256 batchId => uint256 balance)) upxETHBalanceOfRequest;
+mapping(uint256 batchId => uint256 balance) latestUpxETHBalance;
+```
+
+Modify `_initiateWithdrawImpl`:
+
+```diff
+function _initiateWithdrawImpl(
+    address /* account */,
+    uint256 amountToWithdraw,
+    bytes calldata /* data */
+) override internal returns (uint256 requestId) {
+    ...
+    // Initial and final batch ids may overlap between requests so the nonce is used to ensure uniqueness
+-   return nonce << 240 | initialBatchId << 120 | finalBatchId;
++   requestId = nonce << 240 | initialBatchId << 120 | finalBatchId;
+
++   for (uint256 i = initialBatchId; i <= finalBatchId; i += 1) {
++       uint256 currentBalance = upxETH.balanceOf(address(this), i);
++       upxETHBalanceOfRequest[requestId][i] =  currentBalance - latestUpxETHBalance[i];
++       latestUpxETHBalance[i] = currentBalance;
++   }
+    
+}
+```
+
+Modify `_finalizeWithdrawImpl`:
+
+```diff
+function _finalizeWithdrawImpl(
+    address /* account */,
+    uint256 requestId
+) internal override returns (uint256 tokensClaimed, bool finalized) {
+    finalized = canFinalizeWithdrawRequest(requestId);
+
+    if (finalized) {
+        (uint256 initialBatchId, uint256 finalBatchId) = _decodeBatchIds(requestId);
+
+        for (uint256 i = initialBatchId; i <= finalBatchId; i++) {
+-           uint256 assets = upxETH.balanceOf(address(this), i);
++           uint256 assets = upxETHBalanceOfRequest[requestId][i];
+            if (assets == 0) continue;
+            PirexETH.redeemWithUpxEth(i, assets, address(this));
+            tokensClaimed += assets;
++           latestUpxETHBalance[i] -= assets;
+        }
+    }
+
+    WETH.deposit{value: tokensClaimed}();
+}
+```
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/20
+
+
+
+
+# Issue H-4: When users borrow directly from Morpho price of the collateral will not be accurate 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/450 
+
+## Found by 
+mstpr-brainbot, rudhra1749
+
+### Summary
+
+When users have a withdrawal request, the Morpho price oracle will price the request based on the requested value instead of the share amount. However, if users choose to borrow directly from Morpho bypassing the lending router the shares will be priced based on their raw share value, not the request value.
 
 
 
 ### Root Cause
 
-This function lacks a non-reentrant flag, making it vulnerable to possible reentrancy:
+As seen in the following lines:
 
-```solidity
-function initiateWithdrawNative(
-    bytes memory data
-) external override returns (uint256 requestId) {
-    requestId = _withdraw(msg.sender, balanceOf(msg.sender), data);
-}
-```
+* [`AbstractYieldStrategy.sol#L118-L120`](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L118-L120)
+* [`AbstractSingleSidedLP.sol#L300-L303`](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/single-sided-lp/AbstractSingleSidedLP.sol#L300-L303)
 
+If the transient `t_currentAccount` variable is set and the user has a withdrawal request, then the price will be based on the withdrawal request value. However, if the user is borrowing **directly** not via the lending router the `t_currentAccount` is never set. This causes the call to fall back to `super.convertToAssets(shares)`, which prices based on yield token holdings instead.
+
+This introduces a discrepancy: a user with an active withdrawal request is not holding yield tokens, but their shares will still be priced as if they are—potentially leading to mispricing or incorrect collateral valuation.
 
 ### Internal Pre-conditions
 
-A user must just have a collateral position open.
+1. Request a withdrawal and borrow from MORPHO directly not via lending router
 
 ### External Pre-conditions
 
-None
+None needed
 
 ### Attack Path
 
-1. A malicious user has already deposited collateral and has an active position.
-2. The malicious user then calls `exitPosition()` on the **Lending Router**.
-3. The Lending Router transfers the user's collateral shares to the user and then invokes the `burnShare()` function on the **Yield Strategy** contract.
-4. The `burnShares()` function which subsequently calls `_redeemShares()`, which swaps **Yield Tokens** for the underlying **Asset Tokens**.
-5. During the token swap, the malicious user is able to **re-enter** the system and call the `initiateWithdraw()` function. This results in Yield Tokens being transferred to the **Withdraw Request Manager**, creating a withdrawal claim and Yield Tokens being directly transferred to a user. 
-
+Happens naturally
 
 ### Impact
 
-The impact of this vulnerability is significant, as it is trivial to reproduce and can be exploited to block honest users from withdrawing their collateral from the system.
+Oracle will misprice the users collateral. Users shares are not corresponding to yield tokens but withdrawal request underlying tokens but the oracle will price them wrong! 
 
 ### PoC
 
-_No response_
+```solidity
+// forge test --match-test test_price_Inconsistency -vv
+    function test_price_Inconsistency() public {
+
+        console.log("Asset is", IERC20Metadata(address(asset)).symbol());
+
+        address tapir = msg.sender;
+        // deal(address(asset), msg.sender, defaultDeposit); 
+        _enterPosition(tapir, defaultDeposit, 0);
+        uint256 balanceBefore = lendingRouter.balanceOfCollateral(tapir, address(y));
+
+        vm.startPrank(tapir);
+        lendingRouter.initiateWithdraw(tapir, address(y), getWithdrawRequestData(tapir, balanceBefore));
+
+        MarketParams memory marketParams = MorphoLendingRouter(address(lendingRouter)).marketParams(address(y));
+        Id idx = Id.wrap(keccak256(abi.encode(marketParams)));
+        address oracle = marketParams.oracle;
+
+        console.log("Price of the asset is", IOracle(oracle).price());
+        console.log("Price of the vault is", y.price(tapir));
+    }
+```
+
+Test Logs:
+Ran 1 test for tests/TestSingleSidedLPStrategyImpl.sol:Test_LP_Curve_pxETH_ETH
+[PASS] test_price_Inconsistency() (gas: 1904287)
+Logs:
+  Asset is WETH
+  Price of the asset is 1001461263579509710000000000000
+  Price of the vault is 1001459261273599425000000000000
 
 ### Mitigation
 
-**Add the `nonReentrant` modifier to the `initiateWithdrawNative` function.**
+tbd
 
-
-# Issue H-3: `migrateRewardPool` Fails Due to Incompatible Storage Design in `CurveConvexLib` 
+# Issue H-5: `migrateRewardPool` Fails Due to Incompatible Storage Design in `CurveConvexLib` 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/485 
 
+This issue has been acknowledged by the team but won't be fixed at this time.
+
 ## Found by 
-Ledger\_Patrol, bretzel, tjonair, xiaoming90
+Ledger\_Patrol, bretzel, mstpr-brainbot, tjonair, xiaoming90
 
 ### Summary
 
@@ -707,96 +1079,67 @@ _No response_
 
 Create a migration logic for `CurveConvex2Token` where reward pool can be migrated from one to another
 
-# Issue H-4: Liquidations will revert if Bad debt is incurred 
+# Issue H-6: DoS might happen to `DineroWithdrawRequestManager#_initiateWithdrawImpl()` due to overflow on `++s_batchNonce` 
 
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/540 
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/580 
 
 ## Found by 
-Audinarey
+0xpiken, HeckerTrieuTien, Ledger\_Patrol, Ragnarok, X0sauce, heavyw8t, y4y
 
 ### Summary
 
-When a position is opened, [`MORPHO.supplyCollateral()`](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/routers/MorphoLendingRouter.sol#L163) is used to supply collateral to the MORPHO market as shown below
+When `DineroWithdrawRequestManager#initiateWithdraw()` is called to initiate WETH withdrawal, [`DineroWithdrawRequestManager#_initiateWithdrawImpl()`](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/withdraws/Dinero.sol#L17-L39) will be executed to initiate a redemption from `PirexETH`:
+```solidity
+    function _initiateWithdrawImpl(
+        address /* account */,
+        uint256 amountToWithdraw,
+        bytes calldata /* data */
+    ) override internal returns (uint256 requestId) {
+        if (YIELD_TOKEN == address(apxETH)) {
+            // First redeem the apxETH to pxETH before we initiate the redemption
+            amountToWithdraw = apxETH.redeem(amountToWithdraw, address(this), address(this));
+        }
 
-```sol
-File: notional-v4/src/routers/MorphoLendingRouter.sol
-150:     function _supplyCollateral(
+        uint256 initialBatchId = PirexETH.batchId();
+        pxETH.approve(address(PirexETH), amountToWithdraw);
+        // TODO: what do we put for should trigger validator exit?
+        PirexETH.initiateRedemption(amountToWithdraw, address(this), false);
+        uint256 finalBatchId = PirexETH.batchId();
+@>      uint256 nonce = ++s_batchNonce;
 
-//SNIP
-161:         // We should receive shares in return
-162:         ERC20(vault).approve(address(MORPHO), sharesReceived);
-163:   @>    MORPHO.supplyCollateral(m, sharesReceived, onBehalf, ""); 
-164:     }
-
+        // May require multiple batches to complete the redemption
+        require(initialBatchId < MAX_BATCH_ID);
+        require(finalBatchId < MAX_BATCH_ID);
+        // Initial and final batch ids may overlap between requests so the nonce is used to ensure uniqueness
+        return nonce << 240 | initialBatchId << 120 | finalBatchId;
+    }
 ```
+The returned `requestId` is composed by three variables: `nonce`, `initialBatchId`, and `finalBatchId`.
+`nonce` is calculated as below:
+```solidity
+        uint256 nonce = ++s_batchNonce;
+```
+However, `s_batchNonce` is a `uint16` variable. Once its value reaches `65535`, then `++s_batchNonce` will revert the whole `initiateWithdraw()` function, resulting no one can withdraw WETH though `DineroWithdrawRequestManager`. Anyone asset deposited through `DineroWithdrawRequestManager` will be locked forever.
 
 ### Root Cause
 
-A close look at the [`MORPHO.supplyCollateral()`](https://github.com/morpho-org/morpho-blue/blob/b2279f2cbd55baa5a19892541e44b466b2801127/src/Morpho.sol#L303) implementation below shows that it is only the `position[id][onBehalf].collateral` that is incremented when collateral is supplied
-
-```sol
-File: morpho-blue/src/Morpho.sol
-303:     function supplyCollateral(MarketParams memory marketParams, uint256 assets, address onBehalf, bytes calldata data)
-304:         external
-305:     {
-306:         Id id = marketParams.id();
-307:         require(market[id].lastUpdate != 0, ErrorsLib.MARKET_NOT_CREATED);
-308:         require(assets != 0, ErrorsLib.ZERO_ASSETS);
-309:         require(onBehalf != address(0), ErrorsLib.ZERO_ADDRESS);
-310: 
-311:         // Don't accrue interest because it's not required and it saves gas.
-312: 
-313:   @>    position[id][onBehalf].collateral += assets.toUint128(); // user's shares received
-
-```
-
-However during liquidation, when bad debt is incurred when the user's collateral is not enough to cover the debt, the bad debt is socialised in the particular market through [`market[id].totalSupplyAssets`](https://github.com/morpho-org/morpho-blue/blob/b2279f2cbd55baa5a19892541e44b466b2801127/src/Morpho.sol#L400)
-
-```sol
-File: morpho-blue/src/Morpho.sol
-347:     function liquidate(
-348:         MarketParams memory marketParams,
-349:         address borrower,
-
-////SNIP
-390:         uint256 badDebtShares;
-391:         uint256 badDebtAssets;
-392:         if (position[id][borrower].collateral == 0) {
-393:             badDebtShares = position[id][borrower].borrowShares;
-394:             badDebtAssets = UtilsLib.min(
-395:                 market[id].totalBorrowAssets,
-396:                 badDebtShares.toAssetsUp(market[id].totalBorrowAssets, market[id].totalBorrowShares)
-397:             );
-398: 
-399:             market[id].totalBorrowAssets -= badDebtAssets.toUint128();
-400:     @>      market[id].totalSupplyAssets -= badDebtAssets.toUint128();
-401:             market[id].totalBorrowShares -= badDebtShares.toUint128();
-402:             position[id][borrower].borrowShares = 0;
-403:         }
-/////////
-417:     }
-
-```
-
-The problem is that `supplyCollateral()` does not  increase the `market[id].totalSupplyAssets` thus when bad debt is incurred the function will attempt to reduce the `market[id].totalBorrowShares`  which is already zero thus causing the function to revert leaving the protocol with bad positions as the liquidation will not proceed.
-
-Another problem that stems from the use of `MORPHO.supplyCollateral()` is that [interest is not accrued](https://github.com/morpho-org/morpho-blue/blob/b2279f2cbd55baa5a19892541e44b466b2801127/src/Morpho.sol#L181)
+The capacity of `s_batchNonce` is too small.
 
 ### Internal Pre-conditions
 
-NIL
+_No response_
 
 ### External Pre-conditions
 
-NIL
+_No response_
 
 ### Attack Path
 
-See root cause section
+Malicious attacker can call  `DineroWithdrawRequestManager#stakeTokens()` and `DineroWithdrawRequestManager#initiateWithdraw()` repeatedly with different accounts through an approved vault  to quickly increase `s_batchNonce` to `65535`. 
 
 ### Impact
 
-Liquidation can be blocked thus preventing users from liquidating unhealthy positions leaving the protocol insolvent.
+Once `s_batchNonce` reaches `65535`, `DineroWithdrawRequestManager#initiateWithdraw()` call will always revert and no any WETH can be withdrawn from `DineroWithdrawRequestManager`.
 
 ### PoC
 
@@ -804,14 +1147,34 @@ _No response_
 
 ### Mitigation
 
-Consider using `MORPHO.supply()` instead of `MORPHO.supplyCollateral()`
+The reason that defining `s_batchNonce` as `uint16` is  that `s_batchNonce` will be used together with two `uint120` variables to make a `uint256` variable:
+```solidity
+        return nonce << 240 | initialBatchId << 120 | finalBatchId;
+```
+Since `PirexETH.batchId()` will increase one time only every 32 ether redemption, it is unnecessary to record two batchIds in `requestId`. `requestId` can be redesigned as below:
+```code
+|255------136|135---------16|15---------0|
+|s_batchNonce|initialBatchId|deltaBatchId|
+``` 
+Where `uint16 deltaBatchId = finalBatchId - initialBatchId`
+Then `s_batchNonce` can be defined as a `uint120` variable.
 
-# Issue H-5: `RewardManagerMixin.claimAccountRewards` lacks of necessary param check. 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/20/files
+
+
+
+
+# Issue H-7: `RewardManagerMixin.claimAccountRewards` lacks of necessary param check. 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/624 
 
 ## Found by 
-Bluedragon, BugsBunny, HeckerTrieuTien, elolpuer, jasonxiale, patitonar
+Bluedragon, BugsBunny, elolpuer, jasonxiale, patitonar
 
 ### Summary
 
@@ -976,7 +1339,17 @@ _No response_
 
 _No response_
 
-# Issue H-6: Incorrect assumption that one (1) Pendle Standard Yield (SY) token is equal to one (1) Yield Token when computing the price in the oracle 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/16/files
+
+
+
+
+# Issue H-8: Incorrect assumption that one (1) Pendle Standard Yield (SY) token is equal to one (1) Yield Token when computing the price in the oracle 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/689 
 
@@ -1137,7 +1510,7 @@ _No response_
 
 _No response_
 
-# Issue H-7: Hardcoded `useEth = true` in `remove_liquidity_one_coin` or `remove_liquidity` lead to stuck fund 
+# Issue H-9: Hardcoded `useEth = true` in `remove_liquidity_one_coin` or `remove_liquidity` lead to stuck fund 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/691 
 
@@ -1356,7 +1729,7 @@ For exiting pool code, update the code to only set `useEth` to `True` if `TOKEN_
 
 In this scenario, `useEth` should be `false` when exiting the pool. If it is set to `false` in the first place, WETH will be forwarded to the YS vault, and everything will work as expected without error.
 
-# Issue H-8: Malicious user can change the `TradeType` to steal funds from the vault or withdraw request manager 
+# Issue H-10: Malicious user can change the `TradeType` to steal funds from the vault or withdraw request manager 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/715 
 
@@ -1570,240 +1943,142 @@ function _preStakingTrade(address depositToken, uint256 depositAmount, bytes cal
 }
 ```
 
-# Issue H-9: Stuck Withdrawal Due to Slashed/Dissolved Validator in Batched Redemptions 
+## Discussion
 
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/846 
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/18
+
+
+
+
+# Issue H-11: Missing Slippage Protection in Expired PT Redemption Causes User Fund Loss 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/874 
 
 ## Found by 
-0xc0ffEE, Atharv, Ledger\_Patrol, Ragnarok, Schnilch, X0sauce, aman, hgrano, xiaoming90
+0xPhantom2, Bluedragon, Schnilch, albahaca0000, boredpukar, jasonxiale, sergei2340, touristS, xiaoming90, yoooo, zhuying
 
-### Summary
+## Summary:
 
-When withdrawing assets through the `Dinero.sol` contract, the `PirexETH` protocol processes redemptions in 32 ETH batches, with each batch assigned to a specific validator's public key. A critical issue arises if a user's withdrawal spans multiple batches  and one of the associated validators becomes slashed or dissolved. In such a scenario, the entire withdrawal is blocked, preventing the user from accessing any of their funds, even those held by unslashed validators.
+When PT tokens are expired, the `_redeemPT` function calls `redeemExpiredPT` which performs `sy.redeem` with `minTokenOut: 0`, allowing SY contracts that perform external DEX swaps to cause slippage losses without protection in both instant redemption and withdraw initiation flows.
 
+## Vulnerability Details:
 
-### Root Cause
+The vulnerability occurs in the `_redeemPT` function which handles both expired and non-expired PT redemption. When `PT.isExpired()` returns true, it calls `PendlePTLib.redeemExpiredPT`.
 
-A flawed check in `canFinalizeWithdrawRequest` causes it to reject the entire withdrawal if any associated validator is `slashed` or `dissolved`, even if others are valid.
+The [`redeemExpiredPT`](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/staking/PendlePTLib.sol#L87) function performs the redemption by calling `sy.redeem` with `minTokenOut: 0`. This means there's no slippage protection when the SY contract performs external DEX swaps or trades to convert the redeemed tokens to the target `tokenOutSy`.
+
+**Code Snippet:**
+
 ```solidity
-    function canFinalizeWithdrawRequest(uint256 requestId) public view returns (bool) {
-        (uint256 initialBatchId, uint256 finalBatchId) = _decodeBatchIds(requestId);
-        uint256 totalAssets;
-
-        for (uint256 i = initialBatchId; i <= finalBatchId; i++) {
-            IPirexETH.ValidatorStatus status = PirexETH.status(PirexETH.batchIdToValidator(i));
-
-            if (status != IPirexETH.ValidatorStatus.Dissolved && status != IPirexETH.ValidatorStatus.Slashed) {
-                // Can only finalize if all validators are dissolved or slashed
-                return false;
-            }
-
-            totalAssets += upxETH.balanceOf(address(this), i);
-        }
+function redeemExpiredPT(
+        IPPrincipalToken pt,
+        IPYieldToken yt,
+        IStandardizedYield sy,
+        address tokenOutSy,
+        uint256 netPtIn
+    ) external returns (uint256 netTokenOut) {
+        // PT Tokens are known to be ERC20 compliant
+        pt.transfer(address(yt), netPtIn);
+        uint256 netSyOut = yt.redeemPY(address(sy));
+@->     netTokenOut = sy.redeem(address(this), netSyOut, tokenOutSy, 0, true); // AUDIT: no slippage protection
+    }
 ```
-[Here](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/withdraws/Dinero.sol#L71-L87)
 
-### Internal Pre-conditions
+This affects two critical flows:
 
-The user's withdrawal amount is a multiple of 32 ETH, or large enough to necessitate processing across multiple 32 ETH batches.
-
-
-### External Pre-conditions
-
-One or more validators responsible for a portion of the user's batched withdrawal are subjected to slashing or become dissolved.
-
-
-### Attack Path
-
-1. A user initiates a withdrawal of `64` ETH from the `Dinero.sol` contract.
-2. `Dinero.sol` subsequently calls `PirexETH.initiateRedemption`. `PirexETH` processes this withdrawal by splitting the `64` ETH into `2` 32 ETH batches. Each batch is assigned to a unique validator public key  `validatorPubKey1` for batch 1, `validatorPubKey2` for batch 2.
-3. At some point after the initiation, validators assigned to a  batch 2 `validatorPubKey2` gets slashed or dissolved.
-4. The user then attempts to call `finalizeWithdraw` to claim their assets.
-5. During the `finalizeWithdraw` process, `Dinero.sol` invokes `canFinalizeWithdrawRequest`  to ascertain if the withdrawal can be completed.
-6. The `canFinalizeWithdrawRequest` function iterates through the statuses of all validators associated with the withdrawal request, including `validatorPubKey1` and `validatorPubKey2`.
-7. Because `validatorPubKey2` is now marked as `Slashed` or `Dissolved`, the `canFinalizeWithdrawRequest` function returns `false`, causing the entire withdrawal transaction to revert. This occurs despite the fact that the assets associated with `validatorPubKey1` are healthy and could otherwise be safely withdrawn.
-
-
-### Impact
-
-Users are indefinitely blocked from withdrawing if any validator in their batched redemption is slashed or dissolved , which is not correct design choice
-
-
-
-### PoC
-
-NI
-
-### Mitigation
-
-The Best approach for `Dinero` would be to allow admin or trusted users that they could withdraw assets from `PirexETH` for specific batchId, in this way the slashed/dissolved validator batchID assets will remain stuck but the remaining assets can be withdrawn
-
-
-# Issue H-10: Migration of the reward pool will render the strategy contract useless 
-
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/885 
-
-## Found by 
-mstpr-brainbot
-
-### Summary
-
-The upgrade admin can migrate the Convex reward pool if a new Convex "pid" is set for the LP token. However, when doing so, it cannot change the immutable "pid" in the strategy bytecode; instead, it withdraws from the old "pid" and deposits into the new one.
-
-### Root Cause
-
-In Convex, when a reward pool needs to be retired, a new "pid" with a new reward pool is created, because two reward pools cannot point to the same "pid". Migration handles this correctly by withdrawing from the old "pid" and depositing into the new "pid" which, after migration, effectively changes the yield token.
-
-However, `yieldToken` is immutable in the yield strategy, which means that all deposits and withdrawals will still refer to the previous rewardPool/yieldToken. Since the entire LP is now staked in the new "pid", this results in a different token.
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/rewards/ConvexRewardManager.sol#L17-L30
-
-### Internal Pre-conditions
-
-1. Notional migrates from the old pid to new pid
-
-### External Pre-conditions
-
-1. Convex migrates the curve lp token pid to a different pid
-
-### Attack Path
-
-1. See the migration transaction since the strategy will be not reachable by any user due to yield token pointing to a previous yield token which is no longer hold by strategy, attacker can borrow the maximum amount possible 
-
-### Impact
-
-Strategy is completely blocked for any user action. Deposits, withdraws, borrows and liquidations are not possible.
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-When migrating change the "pid" as well or never migrate to a different pid instead let users know they manually need to migrate 
-
-# Issue M-1: Curve gauge interface mismatch 
-
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/74 
-
-## Found by 
-KungFuPanda
-
-## Root cause
-The Curve Gauge Liquidity interface is not compatible with the V6, even though the hardcoded address in the codebase points out **EXACTLY** at the V6 implementation's version.
-
-- https://etherscan.io/address/0x330Cfd12e0E97B0aDF46158D2A81E8Bd2985c6cB#code
-
-I've noticed that you're calling deposit and withdraw with only 1 parameter, yet the v6 gauge requires a claim boolean parameter.
-
-There is an interface incompatibility issue, which will cause consequent reverts.
-
-It was not caught in the tests though because the first condition of the `if/else` clause always shadowed this path.
-
-
-## Vulnerability details
-
-- https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/single-sided-lp/CurveConvex2Token.sol#L290C1-L309C1
+1. **Instant Redemption**: Called via `_executeInstantRedemption`.
+2. **Withdraw Initiation**: Called via `_initiateWithdraw`.
 
 ## Impact
-DoS, inability to use the curve gauge and stake/unstake LP tokens in this settup variant basically:
+
+Users suffer direct fund loss when SY contracts perform unfavorable external DEX swaps during expired PT redemption, as the zero slippage protection allows maximum extractable value attacks and natural slippage losses.
+
+The impact is amplified because users have no control over the redemption rate and cannot protect themselves against adverse market conditions or MEV attacks during the SY redemption process.
+
+## Proof of Concept (Scenario step by step):
+
+1. PT tokens expire and user initiates exit position
+2. `_redeemPT` is called and detects `PT.isExpired() == true`
+3. `PendlePTLib.redeemExpiredPT` is called with the expired PT amount
+4. PT tokens are transferred to YT contract and `yt.redeemPY` is called
+5. `sy.redeem` is called with `minTokenOut: 0`
+6. SY contract performs external DEX swap with unfavorable rates due to market conditions or MEV attacks
+7. User receives significantly fewer `sUSDe` tokens than expected with no recourse
+8. Loss propagates through either instant redemption or withdraw request flows
+
+## Recommended Mitigation:
+
+Modify the `redeemExpiredPT` function to accept a `minTokenOut` parameter and pass it through to `sy.redeem`. Update both calling functions to calculate and provide appropriate slippage protection based on expected redemption rates.
+
 ```solidity
-
-    function _unstakeLpTokens(uint256 poolClaim) internal {
-        if (CONVEX_REWARD_POOL != address(0)) {
-            bool success = IConvexRewardPool(CONVEX_REWARD_POOL).withdrawAndUnwrap(poolClaim, false);
-            require(success);
-        } else {
-            ICurveGauge(CURVE_GAUGE).withdraw(poolClaim);
-        }
-    }
-
-    function _stakeLpTokens(uint256 lpTokens) internal {
-        if (CONVEX_BOOSTER != address(0)) {
-            bool success = IConvexBooster(CONVEX_BOOSTER).deposit(CONVEX_POOL_ID, lpTokens, true);
-            require(success);
-        } else {
-            ICurveGauge(CURVE_GAUGE).deposit(lpTokens);
-        }
-    }
+function redeemExpiredPT(
+    IPPrincipalToken pt,
+    IPYieldToken yt,
+    IStandardizedYield sy,
+    address tokenOutSy,
+    uint256 netPtIn,
+    uint256 minTokenOut  // Add slippage protection parameter
+) external returns (uint256 netTokenOut) {
+    pt.transfer(address(yt), netPtIn);
+    uint256 netSyOut = yt.redeemPY(address(sy));
+    netTokenOut = sy.redeem(address(this), netSyOut, tokenOutSy, minTokenOut, true);
+}
 ```
 
-## Mitigation
-Fix the interface and calldata parameters to ensure the arguments are compatible.
+# Issue M-1: Hard-Coded Mainnet WETH Address Breaks All Non-Mainnet Deployments 
 
-# Issue M-2: Issue in secondary reward emission calculation leads to loss of yield 
-
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/169 
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/195 
 
 ## Found by 
-heavyw8t
+0xShoonya, boredpukar, talfao, vangrim
 
-### Summary
+## Summary
+The protocol’s core contracts (strategies, routers, and withdraw-request managers) all reference a single compile-time constant:
 
-When the user claims their rewards, they also receive additional rewards through a fixed yearly emission rate. The additional reward is first calculated by share and then later multiplied by the number of shares a user has. There are multiple scenarios in which the reward per share for a certain time interval can be less than 1, leading to the reward being rounded to 0.  The user will receive no rewards, even though they would receive significant rewards if their reward per share were multiplied by their share amount.
+```solidity
+WETH9 constant WETH = WETH9(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+```
 
+This is the Ethereum-mainnet WETH9. When the same bytecode is deployed to chains like Arbitrum, Base, or any L2/sidechain whose wrapped-ETH token lives at a different address, every call to `WETH.withdraw()` or `WETH.deposit{value:...}()` will either revert or no-op. 
 
-### Root Cause
+## Vulnerability Description
 
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/rewards/AbstractRewardManager.sol#L287-L314
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/utils/Constants.sol#L19](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/utils/Constants.sol#L19)
 
-As the secondary reward is calculated per single share and only for a certain (potentially minimal) time interval, there are many possible cases in which the dividing term can be larger than the divided term, such as:
-- Reward token with 6 decimals, for example `USDC` (most likely)
-- Low yearly emission rate
-- A High amount of shares/funds in the pool
-- Little time has passed since the last claim
-This causes the reward per share to be smaller than 1, which then gets rounded to 0 by default in Solidity. Since the multiplication with the number of shares happens later, users will receive no rewards.
+Throughout the codebase—e.g. in `AbstractStakingStrategy`, `CurveConvexLib`, `EtherFiWithdrawRequestManager`, and others—`WETH` is declared as a constant pointing at mainnet’s `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` address.
 
-### Internal Pre-conditions
+> Ethereum, in the future we will consider Base or Arbitrum
 
-Either one or both of these conditions:
-- Reward token with 6 decimals, for example `USDC` (most likely)
-- Very Low yearly emission rate
+On chains where that address has no code or contains an unrelated contract:
 
-### External Pre-conditions
+`withdraw()` reverts → funds are stranded inside withdraw-managers (EtherFi, Dinero, Origin, etc.) and strategies during exits.
 
-Either one or both of these conditions:
+`deposit{value: …}()` emits no ERC-20, so accounting under-flows on the very next balanceOf / health-factor check, blocking redemptions and liquidations protocol-wide.
 
-- High amount of shares/funds in the pool
-- Little time has passed since the last claim
+Because the constant is declared at compile-time, recompiling once and re-using the same artefacts for multiple chains is enough to brick the deployment.
 
-Only the internal or external conditions on their own can also be enough, e.g., if the reward token has 6 decimals, even with smaller deposits and a larger claim time window, the issue can still occur
+## Impact
+Medium - Protocol may not work on most of the supported blockchains.
 
+## Likelihood
+Medium - The architecture explicitly targets future deployments on Arbitrum, Base, etc.
 
-### Attack Path
+## Severity
+Medium
 
-- User deposits 100000e6 `USDC`
-- The user borrows `USDC` 100000e6 `USDC` and deposits everything into a SingleSidedLP pool
-- The user receives 200000e18 `yieldTokens` as yield tokens use 18 decimal precision
-- The initial depositor receives the following amount of shares:
-$` sharesMinted = (yieldTokensMinted * effectiveSupply()) / (initialYieldTokenBalance - feesAccrued() + VirtualYieldTokens) `$
-Which, in this case, equates to:
-$` 2e29 = (200000e18 * 1e6()) / (0 - 0 + 1)`$
+## Recommendations
+Make `WETH` an immutable constructor argument or pull it from `AddressRegistry`.
 
-- The user claims their rewards after a week in the protocol through `claimRewards`
-- The secondary rewards are calculated using `_getAccumulatedRewardViaEmissionRate`
-- Let's set the `emissionRatePerYear` to an arbitrary 100000e6 tokens
-The rewards per share are now calculated as follows: $`(604800*1e18*1e11)/(3,154e7*(2e29 + 1e6)) = 0.0096`$
-This value will then be rounded to 0 by Solidity, resulting in the user receiving no secondary rewards. The more users deposit in the pool, the larger the problem becomes as the secondary rewards are divided by a larger and larger effective supply.
-
-### Impact
-
-High
-
-Loss of yield for the user
-
-In the example calculated in the attack path, the user would need to wait two years to claim their reward. If other users were to join the pool, this could get even worse, for example, 20 years if the pool has 1 million `USDC` in total.
-
-### PoC
-
-See Attack path
-
-### Mitigation
-
-Increase the precision of the values used in the calculation first and scale them back down after multiplying with the number of shares further down the line
+At deployment, assert `address(WETH).code.length > 0`.
 
 
-# Issue M-3: Incorrect `tokensClaimed` calculation in `EthenaCooldownHolder::_finalizeCooldown()` blocks withdrawals 
+
+
+
+# Issue M-2: Incorrect `tokensClaimed` calculation in `EthenaCooldownHolder::_finalizeCooldown()` blocks withdrawals 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/263 
 
@@ -1864,7 +2139,181 @@ Users are unable to claim any tokens from their withdrawal requests if they were
 
 Track the balance change when initiating a withdrawal request while `sUSDe.cooldownDuration()` is set to 0, and use this state to determine the balance change when finalizing the withdrawal request.
 
-# Issue M-4: Minting yield tokens single sided can be impossible if CURVE_V2 dexId is used on redemptions 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/19
+
+
+
+
+# Issue M-3: Single sided strategy cant do trades for ETH pools 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/279 
+
+## Found by 
+elolpuer, mstpr-brainbot
+
+### Summary
+
+When users deposit the "asset" into the single-sided Curve LP strategy, the asset is sold for the Curve pool’s underlying tokens.
+However, there is an edge case when one of the pool’s underlying tokens is **ETH**, in which case the trade execution fails because the `TRADING_MODULE` sends back **ETH** when ETH is requested, but the code expects **WETH** to be received.
+
+
+### Root Cause
+
+First, when the ConvexCurve yield strategy is deployed, `TOKEN_1` and `TOKEN_2` are written to storage as follows:
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/single-sided-lp/CurveConvex2Token.sol#L54-L55](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/single-sided-lp/CurveConvex2Token.sol#L54-L55)
+
+Curve pools use the address `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE` to show that one of the pool’s assets is native ETH. Here, we can see that if that’s the case, it’s set to `ETH_ADDRESS`, which is `address(0)`. We can also confirm this from the comments above those lines.
+
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/single-sided-lp/AbstractSingleSidedLP.sol#L181-L219](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/single-sided-lp/AbstractSingleSidedLP.sol#L181-L219)
+
+Now, when the user deposits the asset token and wants to sell some of it for the other underlying Curve token, which is native ETH, then `trade.buyToken` will be `address(0)`, which translates to `ETH_ADDRESS` in the Notional codebase.
+
+```solidity
+trade = Trade({
+    tradeType: t.tradeType,
+    sellToken: address(asset),
+    buyToken: address(tokens[i]),
+    amount: t.tradeAmount,
+    limit: t.minPurchaseAmount,
+    deadline: block.timestamp,
+    exchangeData: t.exchangeData
+});
+```
+
+After `executeTrade` is called in `TRADING_MODULE`, the strategy contract will receive native ETH not WETH!
+We can also confirm from the TradingModule implementation that if the `buyToken` is ETH (`address(0)`), it's ensured that even WETH receivables are withdrawn to ETH, making sure the user receives native ETH instead of WETH:
+[https://github.com/notional-finance/leveraged-vaults/blob/7e0abc3e118db0abb20c7521c6f53f1762fdf562/contracts/trading/TradingUtils.sol#L164-L172](https://github.com/notional-finance/leveraged-vaults/blob/7e0abc3e118db0abb20c7521c6f53f1762fdf562/contracts/trading/TradingUtils.sol#L164-L172)
+
+After these operations, the contract now has some asset balance and some native ETH balance and is ready to LP into the Curve pool with `msg.value`. The following lines are next:
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/single-sided-lp/CurveConvex2Token.sol#L180-L196](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/single-sided-lp/CurveConvex2Token.sol#L180-L196)
+
+```solidity
+uint256 msgValue;
+if (TOKEN_1 == ETH_ADDRESS) {
+    msgValue = _amounts[0];
+} else if (TOKEN_2 == ETH_ADDRESS) {
+    msgValue = _amounts[1];
+}
+if (msgValue > 0) WETH.withdraw(msgValue);
+```
+
+As we can see here, `msgValue` will indeed be greater than 0, and then `WETH.withdraw` will be called. However, we already have ETH balance and no WETH — so the withdraw will revert.
+
+
+### Internal Pre-conditions
+
+1. Curve pool used has ETH as underlying
+
+### External Pre-conditions
+
+None needed
+
+### Attack Path
+
+Happens naturally
+
+### Impact
+
+Users wont be able to deposit on both tokens if the asset is one of the curve lp.
+If the asset is not one of the curve lp then users will not be able to deposit at all
+If the reward token is WETH then everything can be messed up because of withdrawing the WETH.
+
+So, high.
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+Remove the WETH.withdraw since the ETH is received natively to yield strategy
+
+# Issue M-4: Liquidations can be frontrunned to avoid by paying as little as 1 share. 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/300 
+
+## Found by 
+LhoussainePh, pseudoArtist, xiaoming90
+
+### Summary
+
+The protocol integrates with Morpho which internally handeles the debt repayment in a way that when Liquidtions will be frontrunned via repayment with just 1 share it can easily be avoided.
+https://github.com/morpho-org/morpho-blue/blob/731e3f7ed97cf15f8fe00b86e4be5365eb3802ac/src/interfaces/IMorpho.sol#L247
+
+### Root Cause
+
+The internal accounting method of Morpho leads to this bug.
+
+### Internal Pre-conditions
+
+None
+
+### External Pre-conditions
+
+None
+
+### Attack Path
+
+During full liquidation the liquidator calls `liquidate()` which further calls `_liquidate` on MorphoLendingRouter:
+```jsx
+    function _liquidate(
+        address liquidator,
+        address vault,
+        address liquidateAccount,
+        uint256 sharesToLiquidate,
+        uint256 debtToRepay
+    ) internal override returns (uint256 sharesToLiquidator) {
+        MarketParams memory m = marketParams(vault);
+        (sharesToLiquidator, /* */) = MORPHO.liquidate(
+            m, liquidateAccount, sharesToLiquidate, debtToRepay, abi.encode(m.loanToken, liquidator)
+        );
+    }
+```
+
+The above function simply calls the `MORPHO.liquidate()` with full `sharesToLiquidate` and `debtToRepay`, Now if we see the implementation of 
+[Morpho.sol](https://github.com/morpho-org/morpho-blue/blob/731e3f7ed97cf15f8fe00b86e4be5365eb3802ac/src/Morpho.sol#L384-L385):
+
+```jsx
+        position[id][borrower].borrowShares -= repaidShares.toUint128();
+        market[id].totalBorrowShares -= repaidShares.toUint128();
+```
+
+
+The `debtToRepay` is `repaidShares` and when the liquidator tries to repay the full debt all of borrowedShares are reduced by `repaidShares` and the user is fully liquidated, however a user can simply call `exitPosition` to repay as little as 1 share to avoid liquidation , since when a user frontruns the liquidation call with 1 share to repay the debt , the `Morpho.Liquidate` call will panic revert with overflow when subtracting the `repaidShares` from the `borrowShares` and the liquidation will revert.
+
+There is a warning on [Morpho Interface](https://github.com/morpho-org/morpho-blue/blob/731e3f7ed97cf15f8fe00b86e4be5365eb3802ac/src/interfaces/IMorpho.sol#L247) as well for this bug and this can easily be avoided.
+
+
+
+### Impact
+
+ Panic revert with overflow will cause liquidations to fail.
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+When a user calls exitPosition() it has a check `_checkExit` which should be updated to consider a logic for not letting user frequently exit
+Consider making a variable `lastExitTime` and update it every time user exits just like it is done in `enterPosition`
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/14/files
+
+
+
+
+# Issue M-5: Minting yield tokens single sided can be impossible if CURVE_V2 dexId is used on redemptions 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/320 
 
@@ -1925,7 +2374,451 @@ _No response_
 
 Do not allow CURVE_V2 if "asset" token trade.pool is the same. For CURVE_V2 multiple swaps it could be a problem to check each pool but I guess thats not the case since the router has the one doing the swaps not the strategy. 
 
-# Issue M-5: OETH Strategy Broken as Rebasing Not Enabled 
+# Issue M-6: Withdrawals ongoing for OETH, apxETH, weETH, and almost any LST are overpriced by the oracle 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/322 
+
+## Found by 
+0xpiken, mstpr-brainbot, xiaoming90
+
+### Summary
+
+When users initiate a withdrawal, if the yield token has a specific withdrawal method, the withdrawal will be initialized and for LSTs, this means unstaking from the beacon chain, which can take hours, days, or even weeks.
+
+While the withdrawal is not finalized, the price of the token is assumed to be the same as the yield token for example, the OETH amount held in the Withdraw Request Manager contract. However, once the withdrawal is initialized on the beacon chain, LSTs stop earning yield. Therefore, the oracle will always **overprice** the token.
+
+
+### Root Cause
+
+As we can see, when `initiateWithdraw` is called for an LST (e.g., OETH), the OETH will be taken from the yield strategy and sent to the Withdraw Request Manager to initialize the withdrawal process from the beacon chain:
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/staking/AbstractStakingStrategy.sol#L64-L74](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/staking/AbstractStakingStrategy.sol#L64-L74)
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/withdraws/AbstractWithdrawRequestManager.sol#L97-L120](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/withdraws/AbstractWithdrawRequestManager.sol#L97-L120)
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/withdraws/Origin.sol#L12-L19](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/withdraws/Origin.sol#L12-L19)
+
+So the OETH withdrawal from the beacon chain is started. OETH is burned and is now waiting for ETH to be finalized and received from the beacon chain.
+
+Meanwhile, since the user still has collateral on the Morpho market, they can continue borrowing. However, once the withdrawal is initiated, the pricing of the tokens becomes inaccurate:
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/staking/AbstractStakingStrategy.sol#L50-L54](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/staking/AbstractStakingStrategy.sol#L50-L54)
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/withdraws/AbstractWithdrawRequestManager.sol#L307-L340](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/withdraws/AbstractWithdrawRequestManager.sol#L307-L340)
+
+Now, since the withdrawal is not yet finalized, the request remains unfulfilled, and the `else` branch will be executed:
+
+```solidity
+else {
+    // Otherwise we use the yield token rate
+    (tokenRate, /* */) = TRADING_MODULE.getOraclePrice(YIELD_TOKEN, asset);
+    tokenDecimals = TokenUtils.getDecimals(YIELD_TOKEN);
+    tokenAmount = w.yieldTokenAmount;
+}
+```
+
+As we can see, the pricing is done using the YIELD\_TOKEN, which is OETH. However, the OETH has already been burned, and since it's in the withdrawal queue on the beacon chain, **it no longer earns yield!**
+
+
+### Internal Pre-conditions
+
+None needed
+
+### External Pre-conditions
+
+None needed
+
+### Attack Path
+
+1. Initiate withdraw
+2. Collateral is overpriced borrow more without taking LST risk
+
+### Impact
+
+Since the LST holding risk is no longer present once a withdrawal request is initiated and also due to the overpricing of it, users can borrow more from the Morpho market, even though their actual collateral is not as high as it’s assumed to be.
+
+The opposite case can also be problematic, where the LST price decreases (e.g., due to slashing), and the collateral ends up being underpriced.
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+For LST's override the `getWithdrawRequestValue` function
+
+# Issue M-7: Rounding discrepancy between `MorphoLendingRouter::healthFactor` and `Morpho::repay` causes position migration failures 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/417 
+
+## Found by 
+0xRstStn, 0xpiken, Bigsam, Ragnarok, bretzel, mstpr-brainbot, rudhra1749, shiazinho, talfao, touristS, wickie, xiaoming90
+
+### Summary
+
+A flaw in how borrow assets are calculated in `MorphoLendingRouter::healthFactor` causes position migrations to revert under specific conditions. The function underestimates the true debt owed by rounding down, while `Morpho` internally rounds up for repayment. This discrepancy leads to insufficient asset transfers during `AbstractLendingRouter::migratePosition`, breaking a core protocol feature.
+
+Although the rounding difference may not appear initially, it inevitably emerges over time as interest accrues and the market grows, causing migrations that once worked to start failing silently, making this a latent but critical bug.
+
+### Root Cause
+
+In `MorphoLendingRouter::healthFactor`, the borrowed assets are calculated using integer division:
+
+[MorphoLendingRouter::healthFactor#L279](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/routers/MorphoLendingRouter.sol#L279)
+```solidity
+if (position.borrowShares > 0) {
+    borrowed = (uint256(position.borrowShares) * uint256(market.totalBorrowAssets)) / uint256(market.totalBorrowShares);
+}
+```
+
+However, In `Morpho::_isHealthy` and `Morpho::repay`, the equivalent borrow amount is calculated using a rounding-up approach:
+
+[Morpho::_isHealthy#L532](https://github.com/morpho-org/morpho-blue/blob/c75dc8244032b30768217599ae8f1c11e9b43a35/src/Morpho.sol#L532)
+```solidity
+uint256 borrowed = uint256(position[id][borrower].borrowShares).toAssetsUp(
+    market[id].totalBorrowAssets, market[id].totalBorrowShares
+);
+```
+
+[Morpho::repay#L284](https://github.com/morpho-org/morpho-blue/blob/c75dc8244032b30768217599ae8f1c11e9b43a35/src/Morpho.sol#L284)
+```solidity
+else assets = shares.toAssetsUp(market[id].totalBorrowAssets, market[id].totalBorrowShares);
+```
+
+The discrepancy causes `MorphoLendingRouter::healthFactor` to underestimate the amount required to repay a loan, especially by ~1 wei in precision-sensitive scenarios, like `AbstractLending::migratePosition`.
+
+### Internal Pre-conditions
+
+- The user's position must have some borrowed assets.
+- No excess asset tokens are held in the new router during migration (which is by design).
+
+
+### External Pre-conditions
+
+Initially, this rounding inconsistency may not manifest. However, as the market accrues interest and grows, the discrepancy between the round-down calculation used by `MorphoLendingRouter::healthFactor` and the round-up logic used internally by Morpho (e.g. in repay) will inevitably emerge, even for previously safe positions.
+
+### Attack Path
+
+1. `migratePosition` calls `healthFactor` on the previous router, which underestimates the borrow amount.
+2. This amount is used to request a flash loan.
+3. During `_exitWithRepay`, Morpho calls `repay()` with the actual borrow shares.
+4. `repay()` requires more assets (rounded-up) than were flash-borrowed.
+5. The internal `safeTransferFrom` fails due to insufficient balance.
+6. The entire migration reverts.
+
+Check the impact section for more details.
+
+### Impact
+
+This bug has a significant impact: it breaks the `migratePosition` functionality, a core protocol feature designed to allow seamless transitions between lending routers.
+
+The issue stems from an underestimated borrow amount returned by `MorphoLendingRouter::healthFactor`, due to incorrect rounding (rounding down instead of up). This results in insufficient funds being flash-loaned during a migration, ultimately causing the entire operation to revert.
+
+Here’s a breakdown of how this failure manifests step by step:
+
+1. In `AbstractLending::migratePosition` the borrowAmount is obtained from healthFactor (which underestimates the actual borrow due to rounding down):  
+
+[AbstractLendingRouter::migratePosition#L74](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/routers/AbstractLendingRouter.sol#L74)
+```solidity
+function migratePosition(
+    address onBehalf,
+    address vault,
+    address migrateFrom
+) public override isAuthorized(onBehalf, vault) {
+    if (!ADDRESS_REGISTRY.isLendingRouter(migrateFrom)) revert InvalidLendingRouter();
+    // Borrow amount is set to the amount of debt owed to the previous lending router
+@>  (uint256 borrowAmount, /* */, /* */) = ILendingRouter(migrateFrom).healthFactor(onBehalf, vault);
+
+@>  _enterPosition(onBehalf, vault, 0, borrowAmount, bytes(""), migrateFrom);
+}
+```
+
+2. `_enterPosition` passes the underestimated `borrowAmount` into `_flashBorrowAndEnter`, which requests a flash loan for that exact amount:
+
+[AbstractLendingRouter::_enterPosition#L97](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/routers/AbstractLendingRouter.sol#L97)
+```solidity
+if (borrowAmount > 0) {
+    _flashBorrowAndEnter(
+        onBehalf, vault, asset, depositAssetAmount, borrowAmount, depositData, migrateFrom
+    );
+}
+```
+
+3. In the `MorphoLendingRouter::onMorphoFlashLoan` callback, `_enterOrMigrate` is called using only the flash loaned amount (no extra funds):
+
+[MorphoLendingRouter::onMorphoFlashLoan#L140](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/routers/MorphoLendingRouter.sol#L140)
+```solidity
+function onMorphoFlashLoan(uint256 assets, bytes calldata data) external override {
+    require(msg.sender == address(MORPHO));
+
+    (
+        address onBehalf,
+        address vault,
+        address asset,
+        uint256 depositAssetAmount,
+        bytes memory depositData,
+        address migrateFrom
+    ) = abi.decode(data, (address, address, address, uint256, bytes, address));
+
+@>  _enterOrMigrate(onBehalf, vault, asset, assets + depositAssetAmount, depositData, migrateFrom);
+    // Note: depositAssetAmount here is equal to 0, so we're passing only the asset amount we get from `MorphoLendingRouter::healthFactor`
+    ...
+}
+```
+
+4. Because this is a migration, `exitPosition` is called with `assetToRepay = type(uint256).max`, signaling a full repayment:
+
+[AbstractLendingRouter::_enterOrMigrate#L236](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/routers/AbstractLendingRouter.sol#L236)
+```solidity
+    function _enterOrMigrate(
+        address onBehalf,
+        address vault,
+        address asset,
+        uint256 assetAmount,
+        bytes memory depositData,
+        address migrateFrom
+    ) internal returns (uint256 sharesReceived) {
+        if (migrateFrom != address(0)) {
+            // Allow the previous lending router to repay the debt from assets held here.
+            ERC20(asset).checkApprove(migrateFrom, assetAmount);
+            sharesReceived = ILendingRouter(migrateFrom).balanceOfCollateral(onBehalf, vault);
+
+            // Must migrate the entire position
+@>          ILendingRouter(migrateFrom).exitPosition(
+                onBehalf, vault, address(this), sharesReceived, type(uint256).max, bytes("")
+            );
+        } 
+        ...
+    }
+```
+
+5. Inside `_exitWithRepay`, the logic switches to using the user's `borrowShares` directly to calculate repayment:
+
+[MorphoLendingRouter::_exitWithRepay#L192](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/routers/MorphoLendingRouter.sol#L192)
+```solidity
+    function _exitWithRepay(
+        address onBehalf,
+        address vault,
+        address asset,
+        address receiver,
+        uint256 sharesToRedeem,
+        uint256 assetToRepay,
+        bytes calldata redeemData
+    ) internal override {
+        MarketParams memory m = marketParams(vault, asset);
+
+        uint256 sharesToRepay;
+@>      if (assetToRepay == type(uint256).max) {
+            // If assetToRepay is uint256.max then get the morpho borrow shares amount to
+            // get a full exit.
+@>          sharesToRepay = MORPHO.position(morphoId(m), onBehalf).borrowShares;
+@>          assetToRepay = 0;
+        }
+
+        bytes memory repayData = abi.encode(
+            onBehalf, vault, asset, receiver, sharesToRedeem, redeemData, _isMigrate(receiver)
+        );
+
+        // Will trigger a callback to onMorphoRepay
+@>      MORPHO.repay(m, assetToRepay, sharesToRepay, onBehalf, repayData);
+    }
+```
+
+6. When `Morpho` receives the repay request, it uses `toAssetsUp()` — rounding up the amount needed to repay the debt.
+[Morpho::repay#L284](https://github.com/morpho-org/morpho-blue/blob/c75dc8244032b30768217599ae8f1c11e9b43a35/src/Morpho.sol#L284)
+
+7. `Morpho` then calls back to `MorphoLendingRouter::onMorphoRepay`, which attempts to transfer `assetToRepay` from the receiver:
+
+[MorphoLendingRouter::onMorphoRepay#L224](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/routers/MorphoLendingRouter.sol#L224)
+```solidity
+@>  function onMorphoRepay(uint256 assetToRepay, bytes calldata data) external override {
+        require(msg.sender == address(MORPHO));
+
+        ...
+
+        if (isMigrate) {
+            // When migrating we do not withdraw any assets and we must repay the entire debt
+            // from the previous lending router.
+@>          ERC20(asset).safeTransferFrom(receiver, address(this), assetToRepay);
+            // assetToRepay here is the value passed as parameter from Morpho::repay, rounded-up
+            assetsWithdrawn = assetToRepay;
+        }
+    ...
+    } 
+```
+
+This transfer fails because the flash-loaned amount was based on a rounded-down borrow calculation, and is ~1 wei short.
+
+8. Since lending routers do not hold idle assets (by design), there are no extra funds available to cover the difference. This causes the `safeTransferFrom` to revert, breaking the migration flow entirely.
+
+
+### PoC
+
+This proof of concept demonstrates the discrepancy between `MorphoLendingRouter::healthFactor` and Morpho's internal borrow asset calculation (`toAssetsUp`). It uses a real, high-liquidity and interest-accruing market, eUSDE/USDE, as an example, to show how the rounding difference manifests in production conditions.
+
+The following test compares the result of:
+
+- `MorphoLendingRouter::healthFactor` round-down calculation (Notional's implementation)
+- vs Morpho's `toAssetsUp()` round-up logic (used during actual repayment).
+
+1. Create a file named `POC.sol` in `tests/` folder.
+2. Add the following code to the newly created file:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Test, console2} from "forge-std/src/Test.sol";
+import {MORPHO, Id, IMorphoStaticTyping} from "src/interfaces/Morpho/IMorpho.sol";
+
+contract POC3 is Test {
+    /// @dev Warning: The assets to which virtual borrow shares are entitled behave like unrealizable bad debt.
+    uint256 internal constant VIRTUAL_SHARES = 1e6;
+
+    /// @dev A number of virtual assets of 1 enforces a conversion rate between shares and assets when a market is
+    /// empty.
+    uint256 internal constant VIRTUAL_ASSETS = 1;
+
+    // to run this test use --fork-url $RPC_URL 
+    // rpc-url needs to be mainnet
+    function test_healthFactorReturnsIncorrectBorrowAmountOnChain() public view {
+        uint256 shares = 100e6; 
+
+        Id id = Id.wrap(0x140fe48783fe88d2a52b31705577d917628caaf74ff79865b39d4c2aa6c2fd3c);
+        (,, uint128 totalBorrowAssets, uint128 totalBorrowShares,,) = IMorphoStaticTyping(address(MORPHO)).market(id);
+
+        uint256 notionalResult = _calculationNotional(shares, totalBorrowAssets, totalBorrowShares);
+        uint256 morphoResult = _calculationMorpho(shares, totalBorrowAssets, totalBorrowShares);
+
+        console2.log("Protocol borrow amount calculated: ", notionalResult);
+        console2.log("Needed assets to repay loan by Morpho calculation: ", morphoResult);
+
+        assertLt(notionalResult, morphoResult);
+    }
+
+    function test_healthFactorReturnsIncorrectBorrowAmount() public pure {
+        // 1. User will try to redeem 100e6 shares;
+        uint256 shares = 100e6; 
+
+        // Snapshoted values from Morpho market 0x140fe48783fe88d2a52b31705577d917628caaf74ff79865b39d4c2aa6c2fd3c (eUSDE, USDE)
+        // https://app.morpho.org/ethereum/market/0x140fe48783fe88d2a52b31705577d917628caaf74ff79865b39d4c2aa6c2fd3c/eusde-usde
+        // 07/16/2025
+        uint256 totalBorrowAssets = 1683699089027334601033968;
+        uint256 totalBorrowShares = 1607215221550593809991229062204;
+
+        uint256 notionalResult = _calculationNotional(shares, totalBorrowAssets, totalBorrowShares); // Round down to 104
+        uint256 morphoResult = _calculationMorpho(shares, totalBorrowAssets, totalBorrowShares); // Round up to 105
+
+        console2.log("Protocol borrow amount calculated: ", notionalResult);
+        console2.log("Needed assets to repay loan by Morpho calculation: ", morphoResult);
+
+        assertLt(notionalResult, morphoResult);
+    }
+
+    function _calculationMorpho(uint256 a, uint256 b, uint256 c) internal pure returns (uint256) {
+        return toAssetsUp(a, b, c);
+    }
+
+    function _calculationNotional(uint256 a, uint256 b, uint256 c) internal pure returns (uint256) {
+        return (a * b) / c;
+    }
+
+    /// @dev Calculates the value of `shares` quoted in assets, rounding up.
+    function toAssetsUp(uint256 shares, uint256 totalAssets, uint256 totalShares) internal pure returns (uint256) {
+        return mulDivUp(shares, totalAssets + VIRTUAL_ASSETS, totalShares + VIRTUAL_SHARES);
+    }
+
+    /// @dev Returns (`x` * `y`) / `d` rounded up.
+    function mulDivUp(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+        return (x * y + (d - 1)) / d;
+    }
+}
+```
+
+3. Run: 
+
+```shell
+    forge test --mt test_healthFactorReturnsIncorrectBorrowAmount -vvvv
+```
+
+> Output:
+```shell
+    Traces:
+  [18020] POC3::test_healthFactorReturnsIncorrectBorrowAmountOnChain()
+    ├─ [6929] 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb::market(0x140fe48783fe88d2a52b31705577d917628caaf74ff79865b39d4c2aa6c2fd3c) [staticcall]
+    │   └─ ← [Return] Market({ totalSupplyAssets: 1948947786194877138152276 [1.948e24], totalSupplyShares: 1870086616999893965690591681848 [1.87e30], totalBorrowAssets: 1682873320105785386589083 [1.682e24], totalBorrowShares: 1606423686119321497595859897438 [1.606e30], lastUpdate: 1752690551 [1.752e9], fee: 0 })
+    ├─ [0] console::log("Protocol borrow amount calculated: ", 104) [staticcall]
+    │   └─ ← [Stop]
+    ├─ [0] console::log("Needed assets to repay loan by Morpho calculation: ", 105) [staticcall]
+    │   └─ ← [Stop]
+    ├─ [0] VM::assertLt(104, 105) [staticcall]
+    │   └─ ← [Return]
+    └─ ← [Stop]
+```
+
+This 1 wei difference may seem small, but it's sufficient to cause position migration to fail when exact asset repayment is required.
+
+
+### Mitigation
+
+Update `MorphoLendingRouter::healthFactor` to match Morpho's internal borrow share conversion, using the same rounding-up logic:
+
+```solidity
+    borrowed = toAssetsUp(position.borrowShares, market.totalBorrowAssets, market.totalBorrowShares);
+```
+
+> Note: don't forget to add virtual asset/share offset constants (e.g., VIRTUAL_ASSETS, VIRTUAL_SHARES).
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/8
+
+
+
+
+# Issue M-8: Emission rewards will keep accruing even the yield strategy is empty 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/511 
+
+## Found by 
+mstpr-brainbot
+
+### Summary
+
+When there are no depositors in the yield strategy, emission rewards should stop accruing. However, the current implementation incorrectly assumes that effectiveSupply will never be zero its minimum value is hardcoded to 1e6 due to virtual shares. As a result, rewards continue to accrue even when the strategy is completely empty, which is unintended behavior.
+
+### Root Cause
+
+As we can see [here](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/rewards/AbstractRewardManager.sol#L298), when `effectiveSupply < 0`, reward emissions should **not** accrue—this is intended to ensure rewards are only distributed when there are actual depositors in the yield strategy.
+
+However, this assumption is incorrect because `effectiveSupply` is **never zero** due to `VIRTUAL_SHARES`, even when there are no real depositors!
+See:
+[https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L149-L151](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L149-L151)
+
+
+### Internal Pre-conditions
+
+None needed
+
+### External Pre-conditions
+
+None needed
+
+### Attack Path
+
+Happens naturally 
+
+### Impact
+
+All the emission rewards will accrue to rewardPerToken unnecessarily. Functionality broken whats intended is not prevented. 
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+instead of checking effective supply against "0" check against VIRTUAL_SHARES or use totalSupply.
+
+# Issue M-9: OETH Strategy Broken as Rebasing Not Enabled 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/538 
 
@@ -1966,88 +2859,17 @@ Not required. The issue is confirmed in the OETH documentation and can also be v
 
 The simplest mitigation is to migrate to Wrapped OETH, which supports yield accrual.
 
+## Discussion
 
-# Issue M-6: DoS might happen to `DineroWithdrawRequestManager#_initiateWithdrawImpl()` due to overflow on `++s_batchNonce` 
+**sherlock-admin2**
 
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/580 
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/22
 
-## Found by 
-0xpiken, HeckerTrieuTien, Ledger\_Patrol, Ragnarok, X0sauce, heavyw8t, y4y
 
-### Summary
 
-When `DineroWithdrawRequestManager#initiateWithdraw()` is called to initiate WETH withdrawal, [`DineroWithdrawRequestManager#_initiateWithdrawImpl()`](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/withdraws/Dinero.sol#L17-L39) will be executed to initiate a redemption from `PirexETH`:
-```solidity
-    function _initiateWithdrawImpl(
-        address /* account */,
-        uint256 amountToWithdraw,
-        bytes calldata /* data */
-    ) override internal returns (uint256 requestId) {
-        if (YIELD_TOKEN == address(apxETH)) {
-            // First redeem the apxETH to pxETH before we initiate the redemption
-            amountToWithdraw = apxETH.redeem(amountToWithdraw, address(this), address(this));
-        }
 
-        uint256 initialBatchId = PirexETH.batchId();
-        pxETH.approve(address(PirexETH), amountToWithdraw);
-        // TODO: what do we put for should trigger validator exit?
-        PirexETH.initiateRedemption(amountToWithdraw, address(this), false);
-        uint256 finalBatchId = PirexETH.batchId();
-@>      uint256 nonce = ++s_batchNonce;
-
-        // May require multiple batches to complete the redemption
-        require(initialBatchId < MAX_BATCH_ID);
-        require(finalBatchId < MAX_BATCH_ID);
-        // Initial and final batch ids may overlap between requests so the nonce is used to ensure uniqueness
-        return nonce << 240 | initialBatchId << 120 | finalBatchId;
-    }
-```
-The returned `requestId` is composed by three variables: `nonce`, `initialBatchId`, and `finalBatchId`.
-`nonce` is calculated as below:
-```solidity
-        uint256 nonce = ++s_batchNonce;
-```
-However, `s_batchNonce` is a `uint16` variable. Once its value reaches `65535`, then `++s_batchNonce` will revert the whole `initiateWithdraw()` function, resulting no one can withdraw WETH though `DineroWithdrawRequestManager`. Anyone asset deposited through `DineroWithdrawRequestManager` will be locked forever.
-
-### Root Cause
-
-The capacity of `s_batchNonce` is too small.
-
-### Internal Pre-conditions
-
-_No response_
-
-### External Pre-conditions
-
-_No response_
-
-### Attack Path
-
-Malicious attacker can call  `DineroWithdrawRequestManager#stakeTokens()` and `DineroWithdrawRequestManager#initiateWithdraw()` repeatedly with different accounts through an approved vault  to quickly increase `s_batchNonce` to `65535`. 
-
-### Impact
-
-Once `s_batchNonce` reaches `65535`, `DineroWithdrawRequestManager#initiateWithdraw()` call will always revert and no any WETH can be withdrawn from `DineroWithdrawRequestManager`.
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-The reason that defining `s_batchNonce` as `uint16` is  that `s_batchNonce` will be used together with two `uint120` variables to make a `uint256` variable:
-```solidity
-        return nonce << 240 | initialBatchId << 120 | finalBatchId;
-```
-Since `PirexETH.batchId()` will increase one time only every 32 ether redemption, it is unnecessary to record two batchIds in `requestId`. `requestId` can be redesigned as below:
-```code
-|255------136|135---------16|15---------0|
-|s_batchNonce|initialBatchId|deltaBatchId|
-``` 
-Where `uint16 deltaBatchId = finalBatchId - initialBatchId`
-Then `s_batchNonce` can be defined as a `uint120` variable.
-
-# Issue M-7: Incorrect asset matching for ETH/WETH leads to potential DoS of exitPosition in CurveConvexStrategy 
+# Issue M-10: Incorrect asset matching for ETH/WETH leads to potential DoS of exitPosition in CurveConvexStrategy 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/581 
 
@@ -2178,60 +3000,87 @@ function _executeRedemptionTrades(
 }
 ```
 
-# Issue M-8: Some transient variables might break the invariants. 
+# Issue M-11: Users unable to claim rewards when Curve LP tokens are staked to Curve Gauge. 
 
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/619 
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/595 
+
+This issue has been acknowledged by the team but won't be fixed at this time.
 
 ## Found by 
-jamesdean, jasonxiale, xiaoming90
+Bluedragon, Riceee, bretzel, touristS, xiaoming90
+
+### Summary
+According to the contest sponsors the `AbstractRewardManager` acts as the core logic contract for both Booster and Gauge Reward Managers. But claiming rewards for gauge branch is not implemented.
+
+### Vulnerability details 
+The issue here lies when the `CONVEX_BOOSTER` is not initialised. When a user enters a position via Notional, their assets are deposited to a curve pool and the vault receives LP tokens which are further staked for rewards in the Curve Gauge. 
+
+When we take a look at the [`_stakeLpTokens`](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/single-sided-lp/CurveConvex2Token.sol#L291-L298) used to stake the LP tokens, we see they are directly staked to Curve Gauge if Booster is not initialised. But the issue is claiming rewards is only implemented for the Convex Strategy and not for this scenario when LP tokens are staked to Gauge Strategy. 
+
+Lets look at the flow of reward claim -->
+
+1. User calls `claimRewards` on the router
+2. `RewardManagerMixin::claimAccountRewards` is called
+3. `RewardManagerMixing::_updateAccountRewards` is invoked
+4. Delegate call to `updateAccountRewards` on `AbstractRewardManager`
+5. This internally calls the `_claimVaultRewards` 
+
+Given that the `AbstractRewardManager` is the underlying core contract logic for reward claim. Here we notice that the `_claimVaultRewards` function has a check  `if (rewardPool.rewardPool == address(0)) return;` 
+This causes the control flow to return the claim execution process when the rewardPool is not set, which is the case when tokens are staked to Gauge. Resulting in users not able to claim their reward shares from the Curve Gauge. 
+
+### Impact
+The protocol users cannot claim any rewards if the strategy uses Gauge instead of Booster. 
+
+### Code Snippets
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/rewards/AbstractRewardManager.sol#L190
+
+### Mitigation
+When rewardPool == address(0), i.e., the strategy uses Gauge, instead of shortcircuiting, implement logic to claim rewards from the Gauge contract.
+
+# Issue M-12: `PendlePTOracle._getPTRate` isn't correct for some market 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/623 
+
+## Found by 
+jasonxiale
 
 ### Summary
 
-Quoting from the main page:
->After each action via a lending router (enterPosition, exitPosition, migratePosition, liquidate, initiateWithdraw, forceWithdraw, claimRewards, healthFactor), any transient variables on the vault are cleared and cannot be re-used in another call back to the lending router in the same transaction.
+Quoting from the [comment](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/oracles/PendlePTOracle.sol#L60C)
+>ptRate is always returned in 1e18 decimals
 
-transient variables `t_AllowTransfer_To` and `t_AllowTransfer_Amount` might break the invariants in some case.
-
+The `PendlePTOracle._getPTRate` function assumes `ptRate` is always in 1e18 decimals, which isn't correct for some market.
 
 
 ### Root Cause
 
-I'll take [AbstractLendingRouter.exitPosition](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/routers/AbstractLendingRouter.sol#L108-L130) as an example
-1. `_redeemShares` will be called in [AbstractLendingRouter.sol#L123](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/routers/AbstractLendingRouter.sol#L122)
-2. In [AbstractLendingRouter._redeemShares](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/routers/AbstractLendingRouter.sol#L248C14-L269), [IYieldStrategy(vault).allowTransfer](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/routers/AbstractLendingRouter.sol#L260) is called to set transient variables `t_AllowTransfer_To and t_AllowTransfer_Amount`
-```solidity
-219     function allowTransfer(
-220         address to, uint256 amount, address currentAccount
-221     ) external setCurrentAccount(currentAccount) onlyLendingRouter {
-222         // Sets the transient variables to allow the lending market to transfer shares on exit position
-223         // or liquidation.
-224         t_AllowTransfer_To = to;
-225         t_AllowTransfer_Amount = amount;
-226     }
-```
-3. then [IYieldStrategy(vault).burnShares](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/routers/AbstractLendingRouter.sol#L265-L267) will be called.
-4. in [AbstractYieldStrategy.burnShares](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L207C14-L217), `_burnShares` will be called in [AbstractYieldStrategy.sol#L213](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L213)
-5. at the end of [AbstractYieldStrategy._burnShares](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L416-L437), [_burn](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L436) will be called.
-6. winthin `_burn` function, [AbstractYieldStrategy._update](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L333-L345) will be called. 
-
-**Please note at [AbstractYieldStrategy.sol#L334](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L334), only when `from` and `to` both are not zero, the transient variables will be reset**.
-When `_update` is called by `_burn`, `to` will be **zero**, so the [if branch](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/AbstractYieldStrategy.sol#L334-L342) are skipped, **which means the transient variables are not cleared.**
+In function [PendlePTOracle._getPTRate](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/oracles/PendlePTOracle.sol#L60-L66), two AIP will be called: `PENDLE_ORACLE.getPtToSyRate` and `PENDLE_ORACLE.getPtToAssetRate`.
 
 ```solidity
-333     function _update(address from, address to, uint256 value) internal override {
-334         if (from != address(0) && to != address(0)) {
-335             // Any transfers off of the lending market must be authorized here, this means that native balances
-336             // held cannot be transferred.
-337             if (t_AllowTransfer_To != to) revert UnauthorizedLendingMarketTransfer(from, to, value);
-338             if (t_AllowTransfer_Amount < value) revert UnauthorizedLendingMarketTransfer(from, to, value);
-339 
-340             delete t_AllowTransfer_To;
-341             delete t_AllowTransfer_Amount;
-342         }
-343 
-344         super._update(from, to, value);
-345     }
+ 60     /// @dev ptRate is always returned in 1e18 decimals
+ 61     function _getPTRate() internal view returns (int256) {
+ 62         uint256 ptRate = useSyOracleRate ?
+ 63             PENDLE_ORACLE.getPtToSyRate(pendleMarket, twapDuration) :
+ 64             PENDLE_ORACLE.getPtToAssetRate(pendleMarket, twapDuration);
+ 65         return ptRate.toInt();
+ 66     }
 ```
+
+1. function `PENDLE_ORACLE.getPtToAssetRate` will always return ptRate in 1e18 decimals
+2. function `PENDLE_ORACLE.getPtToSyRate` will return ptRate in larger decimals for some markets.
+
+For example: market 0x83916356556f51dcBcB226202c3efeEfc88d5eaA, 0x9471d9c5B57b59d42B739b00389a6d520c33A7a9, 0x08946D1070bab757931d39285C12FEf4313b667B, 0x1C3bA40210fa290de13c62Fe1a9EfcB694725D10, 0x0271A803f0d3Dec9cCd105A4A4d41e6Ee1458765, 0xEDda7526EC81055F2af99d51D968FC2FBca9Ee96, 0xE4AF6375F4424b61B91A1E96b9dE6ff8E842AA3A
+Becase [PENDLE_ORACLE](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/interfaces/IPendle.sol#L411) is defined as `0x66a1096C6366b2529274dF4f5D8247827fe4CEA8`, we can query those market direct from the cast.
+```bash
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0x83916356556f51dcBcB226202c3efeEfc88d5eaA 3600;
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0x9471d9c5B57b59d42B739b00389a6d520c33A7a9 3600;
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0x08946D1070bab757931d39285C12FEf4313b667B 3600;
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0x1C3bA40210fa290de13c62Fe1a9EfcB694725D10 3600;
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0x0271A803f0d3Dec9cCd105A4A4d41e6Ee1458765 3600;
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0xEDda7526EC81055F2af99d51D968FC2FBca9Ee96 3600;
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0xE4AF6375F4424b61B91A1E96b9dE6ff8E842AA3A 3600;
+```
+
 
 
 ### Internal Pre-conditions
@@ -2244,13 +3093,22 @@ None
 
 ### Attack Path
 
-`AbstractLendingRouter.exitPosition` is called
+For example: market 0x83916356556f51dcBcB226202c3efeEfc88d5eaA, 0x9471d9c5B57b59d42B739b00389a6d520c33A7a9, 0x08946D1070bab757931d39285C12FEf4313b667B, 0x1C3bA40210fa290de13c62Fe1a9EfcB694725D10, 0x0271A803f0d3Dec9cCd105A4A4d41e6Ee1458765, 0xEDda7526EC81055F2af99d51D968FC2FBca9Ee96, 0xE4AF6375F4424b61B91A1E96b9dE6ff8E842AA3A
+Becase [PENDLE_ORACLE](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/interfaces/IPendle.sol#L411) is defined as `0x66a1096C6366b2529274dF4f5D8247827fe4CEA8`, we can query those market direct from the cast.
+```bash
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0x83916356556f51dcBcB226202c3efeEfc88d5eaA 3600;
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0x9471d9c5B57b59d42B739b00389a6d520c33A7a9 3600;
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0x08946D1070bab757931d39285C12FEf4313b667B 3600;
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0x1C3bA40210fa290de13c62Fe1a9EfcB694725D10 3600;
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0x0271A803f0d3Dec9cCd105A4A4d41e6Ee1458765 3600;
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0xEDda7526EC81055F2af99d51D968FC2FBca9Ee96 3600;
+cast call -r https://eth-mainnet.public.blastapi.io 0x66a1096C6366b2529274dF4f5D8247827fe4CEA8 "getPtToSyRate(address,uint32)(uint256)"  0xE4AF6375F4424b61B91A1E96b9dE6ff8E842AA3A 3600;
+```
 
 
 ### Impact
 
-transient variables `t_AllowTransfer_To` and `t_AllowTransfer_Amount` might break the invariants in some case.
-
+Incorrect `ptRate` will cause the incrrect price returned by the oracle.
 
 ### PoC
 
@@ -2260,64 +3118,7 @@ _No response_
 
 _No response_
 
-# Issue M-9: Redemption Swap Uses Invalid Pool on Arbitrum for Pendle sUSDe Strategy 
-
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/626 
-
-## Found by 
-0xShoonya, talfao
-
-### Summary
-
-The `_executeInstantRedemption(...)` function includes a hardcoded Curve V2 pool address (`0x167478921b907422F8E88B43C4Af2B8BEa278d3A`) used for swapping `sUSDe` to `sDAI`. While this address is valid on Ethereum mainnet, it does **not exist on Arbitrum**. As a result, if this code is deployed or called on Arbitrum, the redemption flow will fail due to the inability to execute the swap.
-
-### Root Cause
-
-In the redemption logic, the Curve V2 pool is hardcoded as follows [PendlePT_sUSDe.sol#L42](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/staking/PendlePT_sUSDe.sol#L42):
-
-```solidity
-pool: 0x167478921b907422F8E88B43C4Af2B8BEa278d3A, // @audit-issue
-````
-
-This pool exists on Ethereum mainnet but **not** on Arbitrum. There is no fallback logic or per-chain configuration to handle such cases, leading to failure when executed outside Ethereum.
-
-### Internal Pre-conditions
-
-1. Protocol is deployed or used on Arbitrum.
-2. User triggers `_executeInstantRedemption(...)`.
-
-### External Pre-conditions
-
-None.
-
-### Attack Path / Failure Scenario
-
-1. A user performs instant redemption on Arbitrum.
-2. The contract attempts to execute a swap via the hardcoded Curve pool.
-3. The call fails because the pool does not exist on Arbitrum.
-4. The transaction reverts, preventing the redemption and potentially disrupting protocol flow.
-
-### Impact
-
-* **Redemptions break on Arbitrum**, blocking access to funds.
-
-### PoC
-
-Confirmed via block explorer — the pool `0x167478921b907422F8E88B43C4Af2B8BEa278d3A` does not exist on Arbitrum.
-
-### Mitigation
-
-* Remove hardcoded pool addresses and replace with dynamic or per-chain configuration.
-* Introduce a registry or mapping of chain-specific Curve pool addresses.
-* Add validation to ensure pools exist and are callable on the active chain before executing swaps.
-
-```
-
-Let me know if you want this framed as **Medium or High** severity or if you want to pair it with a code snippet fix suggestion.
-```
-
-
-# Issue M-10: Incompatibility of `ERC20::approve` function with USDT tokens on Ethereum Mainnet chain 
+# Issue M-13: Incompatibility of `ERC20::approve` function with USDT tokens on Ethereum Mainnet chain 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/652 
 
@@ -2423,13 +3224,410 @@ The following test shows that the approve function will revert for `USDT` token 
 
 Use OpenZeppelin's `SafeERC20::forceApprove` function instead of `IERC20::approve` function.
 
+## Discussion
 
-# Issue M-11: User unable to migrate under certain edge case 
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/11
+
+
+
+
+# Issue M-14: Value of Etherna's Withdrawal Request is incorrect 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/665 
+
+## Found by 
+xiaoming90
+
+### Summary
+
+-
+
+### Root Cause
+
+-
+
+### Internal Pre-conditions
+
+-
+
+### External Pre-conditions
+
+-
+
+### Attack Path
+
+In Notional, when pricing a withdrawal request that has not been finalized yet, it will always price it against the number of yield tokens within the withdrawal request. This is the correct approach most of the time. For instance, it is correct to price the withdrawal request with wstETH using the wstETH price, because any slashing that occurs during the 7-day waiting period will affect the amount of ETH received at the end. This also applies to other Liquid Staking Tokens (LST) such as EtherFi's weETH. 
+
+If a major slashing event occurs, the market price of the LST will decrease accordingly and be reflected in the price provided by the oracle providers (e.g., Chainlink). This is because the market will take into consideration the adverse event that has occurred. This is how the normal market functions.
+
+That being said, there are instances where it is incorrect to price the withdrawal request using the yield token's price. This generally applies to staking tokens that do not involve slashing, and the amount of tokens received at the end of the wait period is already predetermined when initiating the withdrawal and will not change regardless of subsequent events that may occur. Tokens that fit this category are often stable assets such as USDe.
+
+When the WithdrawRequestManager (WRM) calls `sUSDe.cooldownShares(cooldownBalance)`, the sUSDe shares will be converted to USDe assets in Line 112 below. The `cooldownBalance` number of sUSDe shares will be burned, and the corresponding USDe will be sent to SILO for holding/escrowing in Line 117 within the `_withdraw()` function.
+
+Note that converted USDe assets are sent to SILO for holding/escrowing and the number of USDe assets will not change regardless of any circumstances. The number of converted USDe assets is recorded with the `cooldowns[msg.sender].underlyingAmount` mapping in Line 115 below.
+
+https://etherscan.io/address/0x9d39a5de30e57443bff2a8307a4256c8797a3497#code#F1#L115
+
+```solidity
+File: StakedUSDeV2.sol
+107:   /// @notice redeem shares into assets and starts a cooldown to claim the converted underlying asset
+108:   /// @param shares shares to redeem
+109:   function cooldownShares(uint256 shares) external ensureCooldownOn returns (uint256 assets) {
+110:     if (shares > maxRedeem(msg.sender)) revert ExcessiveRedeemAmount();
+111: 
+112:     assets = previewRedeem(shares);
+113: 
+114:     cooldowns[msg.sender].cooldownEnd = uint104(block.timestamp) + cooldownDuration;
+115:     cooldowns[msg.sender].underlyingAmount += uint152(assets);
+116: 
+117:     _withdraw(msg.sender, address(silo), msg.sender, assets, shares);
+118:   }
+```
+
+To prove this point, the number of USDe assets returned to the user is always equal to the `userCooldown.underlyingAmount` as shown in the `unstake()` function below.
+
+https://etherscan.io/address/0x9d39a5de30e57443bff2a8307a4256c8797a3497#code#F1#L80
+
+```solidity
+File: StakedUSDeV2.sol
+77:   /// @notice Claim the staking amount after the cooldown has finished. The address can only retire the full amount of assets.
+78:   /// @dev unstake can be called after cooldown have been set to 0, to let accounts to be able to claim remaining assets locked at Silo
+79:   /// @param receiver Address to send the assets by the staker
+80:   function unstake(address receiver) external {
+81:     UserCooldown storage userCooldown = cooldowns[msg.sender];
+82:     uint256 assets = userCooldown.underlyingAmount;
+83: 
+84:     if (block.timestamp >= userCooldown.cooldownEnd || cooldownDuration == 0) {
+85:       userCooldown.cooldownEnd = 0;
+86:       userCooldown.underlyingAmount = 0;
+87: 
+88:       silo.withdraw(receiver, assets);
+89:     } else {
+90:       revert InvalidCooldown();
+91:     }
+92:   }
+```
+
+This point is also further supported by the codebase's comment below.
+
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/withdraws/Ethena.sol#L94
+
+```solidity
+File: Ethena.sol
+091:     function canFinalizeWithdrawRequest(uint256 requestId) public view override returns (bool) {
+092:         uint24 duration = sUSDe.cooldownDuration();
+093:         address holder = address(uint160(requestId));
+094:         // This valuation is the amount of USDe the account will receive at cooldown, once
+095:         // a cooldown is initiated the account is no longer receiving sUSDe yield. This balance
+096:         // of USDe is transferred to a Silo contract and guaranteed to be available once the
+097:         // cooldown has passed.
+098:         IsUSDe.UserCooldown memory userCooldown = sUSDe.cooldowns(holder);
+099:         return (userCooldown.cooldownEnd < block.timestamp || 0 == duration);
+100:     }
+```
+
+However, in the protocol, whenever a Withdraw Request (WR) has not been finalized, it will always be priced in yield token (in this case, it is sUSDe), which is incorrect in this instance for Etherna's USDe/sUSDe. This is shown in Line 330 below.
+
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/withdraws/AbstractWithdrawRequestManager.sol#L330
+
+```solidity
+File: AbstractWithdrawRequestManager.sol
+307:     function getWithdrawRequestValue(
+308:         address vault,
+309:         address account,
+310:         address asset,
+311:         uint256 shares
+312:     ) external view override returns (bool hasRequest, uint256 valueInAsset) {
+313:         WithdrawRequest memory w = s_accountWithdrawRequest[vault][account];
+314:         if (w.requestId == 0) return (false, 0);
+315: 
+316:         TokenizedWithdrawRequest memory s = s_tokenizedWithdrawRequest[w.requestId];
+317: 
+318:         int256 tokenRate;
+319:         uint256 tokenAmount;
+320:         uint256 tokenDecimals;
+321:         uint256 assetDecimals = TokenUtils.getDecimals(asset);
+322:         if (s.finalized) {
+323:             // If finalized the withdraw request is locked to the tokens withdrawn
+324:             (tokenRate, /* */) = TRADING_MODULE.getOraclePrice(WITHDRAW_TOKEN, asset);
+325:             tokenDecimals = TokenUtils.getDecimals(WITHDRAW_TOKEN);
+326:             tokenAmount = (uint256(w.yieldTokenAmount) * uint256(s.totalWithdraw)) / uint256(s.totalYieldTokenAmount);
+327:         } else {
+328:             // Otherwise we use the yield token rate
+329:             (tokenRate, /* */) = TRADING_MODULE.getOraclePrice(YIELD_TOKEN, asset);
+330:             tokenDecimals = TokenUtils.getDecimals(YIELD_TOKEN);
+331:             tokenAmount = w.yieldTokenAmount;
+332:         }
+```
+
+As shown in the logic of `cooldownShares` function above, sUSDe no longer exists and has already been converted to a fixed number of USDe. Thus, the correct approach is to price the WR in the fixed amount of USDe instead of sUSDe
+
+If the `getWithdrawRequestValue` is priced in sUSDe, the value it returns will either be inflated because the value of sUSDe rises over time or undervalued if sUSDe depeg.
+
+For instance, the price of USDe is 1 USD, and one sUSDe is worth 1.18 USDe. Thus, the price of sUSDe is 1.18 USD. During the initiate withdrawal, assume that 100 sUSDe of yield tokens will be burned. As such, the WR's `yieldTokenAmount` will be set to 100 sUSDe. When `StakedUSDeV2.cooldownShares()` function is executed, Etherna will burn 100 sUSDe and escrowed a fixed 118 USDe to be released to the WRM once the cooldown period is over.
+
+Assume that the price of sUSDe increases from 1.18 USD to 1.50 USD some time later. In this case, the protocol will still continue to price the WR in yield token (sUSDe) and determine that the value of WR is worth 150 USD, even though it is only worth 118 USD because only a maximum of 118 USDe can be withdrawn from Etherna. The [sUSDe/USD Chainlink price feed](https://data.chain.link/feeds/ethereum/mainnet/susde-usd) shows that the price of sUSDe increases continuously over time.
+
+If the value of WR is 118 USD, the account is already underwater and is subject to liquidation. However, due to the bugs, the protocol incorrectly priced the WR as 150 USD, and believes the account is healthy, preventing the liquidator from liquidating the unhealthy account. Additionally, if the value of WR is inflated, users can borrow more than they are permitted to.
+
+### Impact
+
+High. Inflating the value of WR causes liquidation not to happen when it should OR lead to users borrowing more than they are permitted to, leading to bad debt accumulating and protocol insolvency, which are serious problems. On the other hand, undervaluation of WR leads to the premature liquidation of the user's position, resulting in a loss for the user.
+
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+_No response_
+
+# Issue M-15: Loss of reward tokens during initiating withdrawal due to cooldown 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/669 
+
+## Found by 
+0xDeoGratias, Bigsam, crunter, touristS, xiaoming90, yaractf
+
+### Summary
+
+-
+
+### Root Cause
+
+-
+
+### Internal Pre-conditions
+
+-
+
+### External Pre-conditions
+
+-
+
+### Attack Path
+
+In Line 191 below, if the cooldown has not over yet, the protocol will skip the claiming of rewards from external protocols.
+
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/rewards/AbstractRewardManager.sol#L191
+
+```solidity
+File: AbstractRewardManager.sol
+183:     /// @notice Executes a claim against the given reward pool type and updates internal
+184:     /// rewarder accumulators.
+185:     function _claimVaultRewards(
+186:         uint256 effectiveSupplyBefore,
+187:         VaultRewardState[] memory state
+188:     ) internal {
+189:         RewardPoolStorage memory rewardPool = _getRewardPoolSlot(); // @audit-ok
+190:         if (rewardPool.rewardPool == address(0)) return;
+191:         if (block.timestamp < rewardPool.lastClaimTimestamp + rewardPool.forceClaimAfter) return;
+```
+
+Concerning tracking of rewards, the invariant is that whenever there is a change in `effectiveSupplyBefore` (aka total supply), the protocol must claim the rewards and update the reward accumulation state variable based on the current `effectiveSupplyBefore` before updating the new `effectiveSupply` value. However, this is not always true because the protocol will sometimes skip claiming rewards.
+
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/AbstractYieldStrategy.sol#L150
+
+```solidity
+File: AbstractYieldStrategy.sol
+149:     function effectiveSupply() public view returns (uint256) {
+150:         return (totalSupply() - s_escrowedShares + VIRTUAL_SHARES); // @audit-info VIRTUAL_SHARES = 1e6
+151:     }
+```
+
+Assume the following states at Time T0.
+
+- `rewardPool.forceClaimAfter` is set to 15 minutes.
+- The current balance of yield tokens residing in the Yield Strategy vault, the vault is earning 1 WETH per minutes.
+- The current `effectiveSupply()` is 10. Bob holds 5 shares, while Alice holds 5 shares.
+- `accumulatedRewardPerVaultShare` = 0.
+
+At T5 (5 minutes later since T0), 5 WETH is earned, and `accumulatedRewardPerVaultShare` will increase by 0.5 (5 WETH rewards divided by 10 vault shares), per Line 267 below. This basically means that each share is entitled to 0.5 WETH.
+
+The `accumulatedRewardPerVaultShare` will be 0.5 now and `rewardPool.lastClaimTimestamp` will be set to T5.
+
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/rewards/AbstractRewardManager.sol#L267
+
+```solidity
+File: AbstractRewardManager.sol
+259:     function _accumulateSecondaryRewardViaClaim(
+260:         uint256 index,
+261:         VaultRewardState memory state,
+262:         uint256 tokensClaimed,
+263:         uint256 effectiveSupplyBefore
+264:     ) private {
+265:         if (tokensClaimed == 0) return;
+266: 
+267:         state.accumulatedRewardPerVaultShare += (
+268:             (tokensClaimed * DEFAULT_PRECISION) / effectiveSupplyBefore
+269:         ).toUint128();
+270: 
+271:         _getVaultRewardStateSlot()[index] = state;
+272:     }
+```
+
+At T10 (10 minutes later), Bob decided to call `initiateWithdraw` to initiate a withdrawal, the `s_escrowedShares` will increase by 9. Before `s_escrowedShares` is increased by 5, the following `updateAccountRewards` function at Line 131 will be executed to ensure that Bob claims or retrieves all the reward tokens he is entitled to before initiating the withdrawal. This is critical because, after initiating the withdrawal, Bob can no longer claim the rewards, as per the protocol's design.
+
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/rewards/RewardManagerMixin.sol#L131
+
+```solidity
+File: RewardManagerMixin.sol
+120:     /// @dev Ensures that the account no longer accrues rewards after a withdraw request is initiated.
+121:     function _initiateWithdraw(
+122:         address account,
+123:         uint256 yieldTokenAmount,
+124:         uint256 sharesHeld,
+125:         bytes memory data
+126:     ) internal override returns (uint256 requestId) {
+127:         uint256 effectiveSupplyBefore = effectiveSupply();
+128: 
+129:         // Claim all rewards before initiating a withdraw shares not considered 
+130:         // in the escrow state at this point.
+131:         _updateAccountRewards({
+132:             account: account,
+133:             accountSharesBefore: sharesHeld,
+134:             accountSharesAfter: sharesHeld,
+135:             effectiveSupplyBefore: effectiveSupplyBefore,
+136:             sharesInEscrow: false
+137:         });
+138: 
+139:         requestId = __initiateWithdraw(account, yieldTokenAmount, sharesHeld, data);
+140:     }
+```
+
+The `updateAccountRewards` function will internally execute the `_claimVaultRewards` function in Line 159 below. Since, it is still in cooldown, the claiming of rewards from external protocols will be skipped. Even though a total reward of 5 WETH has accumulated since T5 that is awaiting to be claimed at the external protocol, it is not claimed due to the cooldown. To recap, note that from T0 to T10, 10 minutes have already been passed and a total of 10 WETH is earned. 5 WETH has been claimed and the other 5 WETH has not been claimed.
+
+Subsequently, at Line 173, the `_claimRewardToken` will be executed to claim the rewards for Bob. In this case, based on the current `accumulatedRewardPerVaultShare` (0.5), Bob will receive 2.5 WETH. Here, we can already see a valid issue that although a total of 10 WETH is earned, Bob only received 2.5 WETH instead of 5 WETH. This means that Alice will be able to obtain a rewards of 7.5 WETH later once the cooldown is over.
+
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/rewards/AbstractRewardManager.sol#L173
+
+```solidity
+File: AbstractRewardManager.sol
+148:     function updateAccountRewards(
+149:         address account,
+150:         uint256 effectiveSupplyBefore,
+151:         uint256 accountSharesBefore,
+152:         uint256 accountSharesAfter,
+153:         bool sharesInEscrow
+154:     ) external returns (uint256[] memory rewards) {
+155:         // Short circuit in this case, no rewards to claim
+156:         if (sharesInEscrow && accountSharesAfter > 0) return rewards;
+157: 
+158:         VaultRewardState[] memory state = _getVaultRewardStateSlot();
+159:         _claimVaultRewards(effectiveSupplyBefore, state);
+160:         rewards = new uint256[](state.length);
+161: 
+162:         for (uint256 i; i < state.length; i++) {
+163:             if (sharesInEscrow && accountSharesAfter == 0) {
+164:                 delete _getAccountRewardDebtSlot()[state[i].rewardToken][account];
+165:                 continue;
+166:             }
+167: 
+168:             if (0 < state[i].emissionRatePerYear) {
+169:                 // Accumulate any rewards with an emission rate here
+170:                 _accumulateSecondaryRewardViaEmissionRate(i, state[i], effectiveSupplyBefore);
+171:             }
+172: 
+173:             rewards[i] = _claimRewardToken(
+174:                 state[i].rewardToken,
+175:                 account,
+176:                 accountSharesBefore,
+177:                 accountSharesAfter,
+178:                 state[i].accumulatedRewardPerVaultShare
+179:             );
+180:         }
+181:     }
+```
+
+The root cause here is that, during initiating withdrawal, the cooldown should not be applicable and the claiming of reward tokens from external protocol must always occur. This is ensure that the `accumulatedRewardPerVaultShare` is updated to the latest state before Bob claims his reward for the last time.
+
+### Impact
+
+High, loss of funds (reward tokens) for the affected victim as shown above.
+
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+During initiating withdrawal, the cooldown should not be applicable and the claiming of reward tokens from the external protocol must always occur. This ensures that the `accumulatedRewardPerVaultShare` is updated to the latest state before Bob claims his reward for the last time.
+
+# Issue M-16: Users will be unfairly liquidated if collateral value drops after initiating withdraw request 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/673 
+
+## Found by 
+xiaoming90
+
+### Summary
+
+-
+
+### Root Cause
+
+-
+
+### Internal Pre-conditions
+
+-
+
+### External Pre-conditions
+
+-
+
+### Attack Path
+
+One of the most critical features of the new Notional exponent is that it allows users to `initiateWithdraw` of their shares while they are being held as collateral on lending protocols. 
+
+An important note here is that after a user has initiated a withdrawal, this doesn't mean that the user has exited their positions. In fact, the user have not exited their positions yet, and initiating a withdrawal simply allows the underlying staking tokens assigned to the external protocol's redemption queue in advance so that users can skip the redemption waiting period if they intend to withdraw later (It's up to the users whether they want to exit the position or not).
+
+After a user initiates a withdrawal, a withdrawal request will be created and tagged to their account. If there is a pending withdrawal request, the users can no longer mint any new Yield Strategy vault shares, as shown in Line 197 below.
+
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/AbstractYieldStrategy.sol#L197
+
+```solidity
+File: AbstractYieldStrategy.sol
+191:     function mintShares(
+192:         uint256 assetAmount,
+193:         address receiver,
+194:         bytes calldata depositData
+195:     ) external override onlyLendingRouter setCurrentAccount(receiver) nonReentrant returns (uint256 sharesMinted) {
+196:         // Cannot mint shares if the receiver has an active withdraw request
+197:         if (_isWithdrawRequestPending(receiver)) revert CannotEnterPosition();
+```
+
+Assume that Bob initiates a withdrawal request. It takes 7 days for the withdrawal in the external protocol to be finalized, which is a pretty standard timeframe (e.g., LIDO's wstETH, Ethena's sUSDe).
+
+However, if the price of Bob's position collateral decreases within these 7 days (e.g., Bob's collateral price drops) and his account is on the verge of being liquidated (not yet, but soon), there is no way for Bob to top-up his "margin" or collateral to save his position because he is blocked from doing so due to an existing withdrawal request in his account. As such, he can only watch his position being liquidated by someone else. When his position is liquidated, he will incur a loss as part of his total position's fund is given to the liquidator.
+
+This is a common scenario in which the price of yield tokens gradually decreases over time due to certain unfavorable market conditions. In this case, it is normal that users will want to top up the "margin" of their positions to avoid being liquidated. The "margin" here refers to the collateral value of the position in the context of Morpho's position, but the idea/concept is the same as that of a typical leveraged trading platform.
+
+Note that this is not the intended design of the protocol, as all leveraged products allow their users to top up their margin if it falls close to the liquidation margin or falls below the liquidation margin, so that users can avoid being liquidated. Users will always want to avoid liquidation due to the loss incurred from the liquidation fee or incentive given to the liquidators, and they can only recover a portion of their assets after liquidation.
+
+### Impact
+
+High. Loss of funds as shown in the scenario above. A portion of his position's funds is lost to the liquidator.
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+_No response_
+
+# Issue M-17: User unable to migrate under certain edge case 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/674 
 
 ## Found by 
-0xRstStn, 0xpiken, Bigsam, Bizarro, EFCCWEB3, Ledger\_Patrol, Oxsadeeq, Ragnarok, Riceee, X0sauce, aman, bretzel, coffiasd, dan\_\_vinci, dhank, h2134, hard1k, jprod15, mstpr-brainbot, n1ikh1l, rudhra1749, shiazinho, talfao, theweb3mechanic, touristS, wickie, xiaoming90
+Bigsam, Ledger\_Patrol, Ragnarok, Riceee, X0sauce, aman, coffiasd, dan\_\_vinci, dhank, h2134, hard1k, shiazinho, theweb3mechanic, xiaoming90
 
 ### Summary
 
@@ -2564,12 +3762,107 @@ _No response_
 
 Skip the repayment if debt is zero, and proceed with the migration.
 
-# Issue M-12: Unable to deposit to Convex in Arbitrum 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/9
+
+
+
+
+# Issue M-18: Reducing liquidity in the hardcoded Curve sDAI/sUSDe pool leads to unnecessary slippage loss 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/677 
+
+## Found by 
+xiaoming90
+
+### Summary
+
+-
+
+### Root Cause
+
+-
+
+### Internal Pre-conditions
+
+-
+
+### External Pre-conditions
+
+-
+
+### Attack Path
+
+Maker's Savings DAI (sDAI) is the old version of SKY's Savings USDS (sUSDS). The OG Maker DAI protocol has migrated to the new SKY protocol. sDAI is issued by old Maker DAI while sUSDS is issued by new SKY protocol.
+
+This part of the code, where sUSDe is swapped to sDAI and then swapped to the asset token, is taken from the old Notional code during the period when Maker had not migrated to SKY yet. In the past, the sDAI/sUSDe curve pool has had larger liquidity.
+
+However, eventually, the liquidity in the hardcoded Curve sDAI/sUSDe (0x167478921b907422F8E88B43C4Af2B8BEa278d3A) pool will decrease as users migrate over to the newer sUSDS since the newer SKY protocol is where the majority of the incentives are allocated at the moment. Users will be incentivized to move to sUSDS over time.
+
+The following is the on-chain liquidity data of the Curve sDAI/sUSDe pool, showing that the balance of sDAI steadily decreases over time, aligned with the points mentioned above.
+
+- 12 month ago (Apr-06-2024)(19600000) - 6.4 million sDAI
+
+- 6 month ago (Jan-11-2025)(Block - 21600000) - 6.2 million sDAI
+
+- 3 months ago (Apr-04-2025) 22196000 - 5.6 million sDAI
+
+- Today (Jul-13-2025)  - 5.2 million sDAI
+
+If the liquidity is reduced or decreased to a lower level, the users are still forced to swap with this curve pool due to the hardcoded swap logic here (sUSDe -> sDAI -> assets), incurring unnecessary slippage due to low liquidity in Curve sDAI/sUSDe pool.
+
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/staking/PendlePT_sUSDe.sol#L42
+
+```solidity
+File: PendlePT_sUSDe.sol
+23:     /// @notice The vast majority of the sUSDe liquidity is in an sDAI/sUSDe curve pool.
+24:     /// sDAI has much greater liquidity once it is unwrapped as DAI so that is done manually
+25:     /// in this method.
+26:     function _executeInstantRedemption(
+27:         uint256 yieldTokensToRedeem,
+28:         bytes memory redeemData
+29:     ) internal override virtual returns (uint256 assetsPurchased) {
+30:         PendleRedeemParams memory params = abi.decode(redeemData, (PendleRedeemParams));
+31:         uint256 netTokenOut = _redeemPT(yieldTokensToRedeem, params.limitOrderData);
+32: 
+33:         Trade memory sDAITrade = Trade({
+34:             tradeType: TradeType.EXACT_IN_SINGLE,
+35:             sellToken: address(sUSDe),
+36:             buyToken: address(sDAI),
+37:             amount: netTokenOut,
+38:             limit: 0, // NOTE: no slippage guard is set here, it is enforced in the second leg
+39:                         // of the trade.
+40:             deadline: block.timestamp,
+41:             exchangeData: abi.encode(CurveV2SingleData({
+42:                 pool: 0x167478921b907422F8E88B43C4Af2B8BEa278d3A,
+43:                 fromIndex: 1, // sUSDe
+44:                 toIndex: 0 // sDAI
+45:             }))
+46:         });
+```
+
+### Impact
+
+High. Loss of funds due to unnecessary slippage
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+_No response_
+
+# Issue M-19: Unable to deposit to Convex in Arbitrum 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/678 
 
 ## Found by 
-Bluedragon, Riceee, bretzel, dan\_\_vinci, elolpuer, khaye26, touristS, xiaoming90
+dan\_\_vinci, elolpuer, khaye26, xiaoming90
 
 ### Summary
 
@@ -2667,161 +3960,7 @@ function _stakeLpTokens(uint256 lpTokens) internal {
 }
 ```
 
-# Issue M-13: Certain Curve V2 pool cannot be supported 
-
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/683 
-
-## Found by 
-xiaoming90
-
-### Summary
-
--
-
-### Root Cause
-
--
-
-### Internal Pre-conditions
-
--
-
-### External Pre-conditions
-
--
-
-### Attack Path
-
-The protocol is designed to support Curve V2 pool.
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/interfaces/Curve/ICurve.sol#L4
-
-```solidity
-File: ICurve.sol
-4: enum CurveInterface {
-5:     V1,
-6:     V2,
-7:     StableSwapNG
-8: }
-```
-
-The protocol interacts with Curve V2 pool via the `remove_liquidity()` function, which accepts four (4) parameters. Notice that the third parameter is a boolean, and the fourth (last) parameter is an address.
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/single-sided-lp/CurveConvex2Token.sol#L156
-
-```solidity
-File: CurveConvex2Token.sol
-146:     function checkReentrancyContext() external {
-..SNIP..
-153:         } else if (CURVE_INTERFACE == CurveInterface.V2) {
-154:             // Curve V2 does a `-1` on the liquidity amount so set the amount removed to 1 to
-155:             // avoid an underflow.
-156:             ICurve2TokenPoolV2(CURVE_POOL).remove_liquidity(1, minAmounts, true, address(this));
-```
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/single-sided-lp/CurveConvex2Token.sol#L281
-
-```solidity
-File: CurveConvex2Token.sol
-244:     function _exitPool(
-245:         uint256 poolClaim, uint256[] memory _minAmounts, bool isSingleSided
-246:     ) internal returns (uint256[] memory exitBalances) {
-..SNIP..
-279:                 // Remove liquidity on CurveV2 does not return the exit amounts so we have to measure
-280:                 // them before and after.
-281:                 ICurve2TokenPoolV2(CURVE_POOL).remove_liquidity(
-282:                     // Last two parameters are useEth = true and receiver = this contract
-283:                     poolClaim, minAmounts, true, address(this)
-284:                 );
-```
-
-This is aligned with the `remove_liquidity()` interface of Curve V2 (version 0.3.1) pool, where the pool type is "Two Coin CryptoSwap" as shown below. Some examples of such pools are:
-
-- https://www.curve.finance/dex/ethereum/pools/teth/deposit/ (t/ETH)
-- https://www.curve.finance/dex/ethereum/pools/factory-crypto-230/deposit/ (LPXCVX/CVX)
-
-```python
-# @version 0.3.1
-# (c) Curve.Fi, 2021
-# Pool for two crypto assets
-
-# Expected coins:
-# eth/whatever
-..SNIP..
-@external
-@nonreentrant('lock')
-def remove_liquidity(_amount: uint256, min_amounts: uint256[N_COINS],
-                     use_eth: bool = False, receiver: address = msg.sender):
-    """
-    This withdrawal method is very safe, does no complex math
-    """
-```
-
-However, the problem is that there is another Curve V2 ("Two Coin CryptoSwap"), and the version is 0.3.0. Examples of such pools are the https://www.curve.finance/dex/ethereum/pools/eursusd/deposit/ (eursusd).
-
-If the code attempts to remove liquidity, the transaction will revert as the `remove_liquidity()` function only accepts three (3) input parameters, as shown below.
-
-```python
-# @version 0.3.0
-# (c) Curve.Fi, 2021
-# Pool for two crypto assets
-
-from vyper.interfaces import ERC20
-# Expected coins:
-# eth/whatever
-..SNIP..
-@external
-@nonreentrant('lock')
-def remove_liquidity(_amount: uint256, min_amounts: uint256[N_COINS], use_eth: bool = False):
-    """
-    This withdrawal method is very safe, does no complex math
-    """
-    _coins: address[N_COINS] = coins
-    total_supply: uint256 = CurveToken(token).totalSupply()
-```
-
-The similar issue also occurs for the `add_liquidity()` function, as the function interface for various Curve V2 pools (0.3.1 and 0.3.0) are different. Note that both 0.3.1 and 0.3.0 are valid Curve V2 pools that are still running live in Curve protocol today.
-
-```python
-# @version 0.3.0
-# (c) Curve.Fi, 2021
-# Pool for two crypto assets
-..SNIP..
-def add_liquidity(amounts: uint256[N_COINS], min_mint_amount: uint256, use_eth: bool = False) -> uint256:
-```
-
-```python
-# @version 0.3.1
-# (c) Curve.Fi, 2021
-# Pool for two crypto assets
-..SNIP..
-# Expected coins:
-# eth/whatever
-def add_liquidity(amounts: uint256[N_COINS], min_mint_amount: uint256,
-                  use_eth: bool = False, receiver: address = msg.sender) -> uint256:
-```
-
-Per the [contest's README](https://github.com/sherlock-audit/2025-06-notional-exponent-xiaoming9090/tree/main?tab=readme-ov-file#q-please-discuss-any-design-choices-you-made), the protocol is designed to be extendable to new yield strategies and opportunities.
-
-> Q: Please discuss any design choices you made.
-> Notional Exponent is designed to be extendable to new yield strategies and opportunities as well as new lending platforms. 
-
-However, in this case, it is shown that certain Curve V2 pools cannot be supported, which does not meet the requirements.
-
-### Impact
-
-Medium. Core functionality is broken.
-
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-_No response_
-
-# Issue M-14: Lack of minimum debt threshold enables unliquidatable small positions 
+# Issue M-20: Lack of minimum debt threshold enables unliquidatable small positions 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/684 
 
@@ -2925,86 +4064,7 @@ _No response_
 - Enforce a minimum borrow size
 - Or prevent users from leaving behind trivial debt after repay or withdrawal.
 
-# Issue M-15: Migration will not work due to insufficient borrowed amount to cover the flash-loan 
-
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/690 
-
-## Found by 
-xiaoming90
-
-### Summary
-
--
-
-### Root Cause
-
--
-
-### Internal Pre-conditions
-
--
-
-### External Pre-conditions
-
--
-
-### Attack Path
-
-The migration will not work under certain conditions.
-
-Assume a Yield Strategy Vault with the following setup:
-
-- Yield token is equal to wstETH
-- Share name = YS-wstETH
-
-Assume that in the current Morph pool, the collateral is YS-wstETH share, and its LTV = 0.8. Each YS-wsETH is worth 500.
-
-Currently, two (2) YS-wsETH is deposited as collateral by Bob in his position, so his collateral value is worth 1000, while he has a debt of 800. This is permitted because `1000 value * 0.8 (LTV) = 800`.
-
-Bob intends to migrate to a newer Morpho Fixed pool or a different lending protocol. Assume that Bob wants to migrate to $LendingProtocol_X$.
-
-1. The migration works by only utilizing the flash loan to repay the old debt. The protocol will flash loan 800 from the new $LendingProtocol_X$ and use it to repay the old debt (800) in the current Morpho pool.
-
-2. Once the old debt in the Morpho pool has been cleared, the two (2) YS-wstETH will be withdrawn from the old Morpho pool.
-3. Two (2) YS-wstETH will be deposited into the new $LendingProtocol_X$ as collateral, and the code will borrow an additional 800 to cover the flash-loan amount of 800.
-
-However, the main problem here is that there is no guarantee that the LTV of YS-wstETH shares in the new $LendingProtocol_X$ remain the same as the old Morpho pool (0.8). 
-
-Assume that the LTV of YS-wstETH shares in the new $LendingProtocol_X$ is 0.6. In this case, the maximum amount that can be borrowed is only 600. So, there is a shortfall of 200 here. As such, it is insufficient to cover the flash-loan amount of 800, and the migration will revert.
-
-During migration, the amount of assets you want to deposit or top up is hardcoded at zero, as shown in Line 76 below. Thus, there is no way for Bob to top up or deposit 200 to cover the shortfall, even if he wishes.
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/routers/AbstractLendingRouter.sol#L76
-
-```solidity
-File: AbstractLendingRouter.sol
-67:     function migratePosition(
-68:         address onBehalf,
-69:         address vault,
-70:         address migrateFrom
-71:     ) public override isAuthorized(onBehalf, vault) {
-72:         if (!ADDRESS_REGISTRY.isLendingRouter(migrateFrom)) revert InvalidLendingRouter();
-73:         // Borrow amount is set to the amount of debt owed to the previous lending router
-74:         (uint256 borrowAmount, /* */, /* */) = ILendingRouter(migrateFrom).healthFactor(onBehalf, vault);
-75: 
-76:         _enterPosition(onBehalf, vault, 0, borrowAmount, bytes(""), migrateFrom); // @audit-info depositAssetAmount => 0, depositData => ""
-77:     }
-```
-
-### Impact
-
-Migration is a core functionality of the protocol. As shown in the report, the migration function is broken.
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-Allow users to top up or deposit the shortfall during the migration process.
-
-
-# Issue M-16: Funds stuck if one of the withdrawal requests cannot be finalized 
+# Issue M-21: Funds stuck if one of the withdrawal requests cannot be finalized 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/692 
 
@@ -3093,122 +4153,7 @@ _No response_
 
 _No response_
 
-# Issue M-17: Unable to unstake Curve LP tokens from Arbitrum 
-
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/701 
-
-## Found by 
-xiaoming90
-
-### Summary
-
--
-
-### Root Cause
-
--
-
-### Internal Pre-conditions
-
--
-
-### External Pre-conditions
-
--
-
-### Attack Path
-
-Per the contest's README, Base and Arbitrum are in-scope for this contest. Sherlock's Judge has further confirmed this in the Discord channel.
-
-> Q: On what chains are the smart contracts going to be deployed?
-> Ethereum, in the future we will consider Base or Arbitrum
-
-Per the Convex documentation, it mentioned the following:
-
-> Unlike mainnet, there is no more "WithdrawAndUnwrap" option. The only withdraw function is now a plain withdraw(uint256 _amount, bool _claim) or withdrawAll(bool claim).   This will return the Curve LP token much like the "unwrap" method on mainnet.
-
-However, it was found that Notional unstakes the Curve LP token via the `withdrawAndUnwrap()` function regardless of whether it is Ethereum or Arbitrum chain.
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/single-sided-lp/CurveConvex2Token.sol#L301
-
-```solidity
-File: CurveConvex2Token.sol
-301:     function _unstakeLpTokens(uint256 poolClaim) internal {
-302:         if (CONVEX_REWARD_POOL != address(0)) {
-303:             bool success = IConvexRewardPool(CONVEX_REWARD_POOL).withdrawAndUnwrap(poolClaim, false);
-304:             require(success);
-305:         } else {
-306:             ICurveGauge(CURVE_GAUGE).withdraw(poolClaim);
-307:         }
-308:     }
-```
-
-As a result, on Arbitrum, the Curve LP tokens will not be able to be unstake from Convex, leading to the user's funds being stuck.
-
-The following shows that only `withdraw()` and `withdrawAll()` functions are supported in Arbitrum's ConvexRewardPool. The `withdrawAndUnwrap()` function is not supported in Arbitrum.
-
-https://arbiscan.io/address/0xFDC6304b38d0703F0D0d13b665ceE92499039383#code#F1#L385
-
-```solidity
-    //withdraw balance and unwrap to the underlying lp token
-    function withdraw(uint256 _amount, bool _claim) public returns(bool){
-
-        //checkpoint first if claiming, or burn will call checkpoint anyway
-        if(_claim){
-            //checkpoint with claim flag
-            _checkpoint(msg.sender, msg.sender);
-        }
-
-        //change state
-        //burn will also call checkpoint
-        _burn(msg.sender, _amount);
-
-        //tell booster to withdraw underlying lp tokens directly to user
-        IBooster(convexBooster).withdrawTo(convexPoolId,_amount,msg.sender);
-
-        emit Withdrawn(msg.sender, _amount);
-
-        return true;
-    }
-```
-
-https://arbiscan.io/address/0xFDC6304b38d0703F0D0d13b665ceE92499039383#code#F1#L426
-
-```solidity
-    //withdraw full balance
-    function withdrawAll(bool claim) external{
-        withdraw(balanceOf(msg.sender),claim);
-    }
-```
-
-### Impact
-
-High. Loss of funds, as the user's funds will be stuck. The issue is serious because users can enter the position (aka deposit to the protocol), but cannot withdraw their funds.
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-```diff
-    function _unstakeLpTokens(uint256 poolClaim) internal {
-        if (CONVEX_REWARD_POOL != address(0)) {
-+           bool success;
-+           if (Deployments.CHAIN_ID == Constants.CHAIN_ID_MAINNET) {      	
--                      bool success = IConvexRewardPool(CONVEX_REWARD_POOL).withdrawAndUnwrap(poolClaim, false);
-+                      success = IConvexRewardPool(CONVEX_REWARD_POOL).withdrawAndUnwrap(poolClaim, false);
-+           } else if (Deployments.CHAIN_ID == Constants.CHAIN_ID_ARBITRUM) {
-+                      success = IConvexRewardPool(CONVEX_REWARD_POOL).withdraw(poolClaim, false);
-+           }
-            require(success);
-        } else {
-            ICurveGauge(CURVE_GAUGE).withdraw(poolClaim);
-        }
-    }
-```
-
-# Issue M-18: Setup with `asset = WETH` and a Curve pool that contains Native ETH will lead to a loss for the users 
+# Issue M-22: Setup with `asset = WETH` and a Curve pool that contains Native ETH will lead to a loss for the users 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/708 
 
@@ -3453,12 +4398,12 @@ _No response_
 
 _No response_
 
-# Issue M-19: Yield Strategy shares can be transferred without lending router approval 
+# Issue M-23: Unable to support Curve Pool with Native ETH 
 
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/714 
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/717 
 
 ## Found by 
-xiaoming90
+auditgpt, touristS, xiaoming90
 
 ### Summary
 
@@ -3478,367 +4423,113 @@ xiaoming90
 
 ### Attack Path
 
-Per the [documentation](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/audit/Documentation.md#yield-strategy) in the contest's repository, one of the key restrictions imposed by the system is that all transfers of yield strategy shares must be approved by the lending router:
+If any of the tokens of the Curve Pool are Native ETH (0xEEEEE...), the `_rewriteAltETH()` function at Lines 54 and 55 will rewrite the address from 0xEEEEE to 0x00000.
 
-> - All transfers must be approved by a lending router. This is in addition to the normal ERC20 approval allowance. This ensures that collateral held on a lending protocol cannot be withdrawn without first going through the Notional lending router.
-
-Per the [contest's README](https://github.com/sherlock-audit/2025-06-notional-exponent-xiaoming9090/tree/main?tab=readme-ov-file#q-please-discuss-any-design-choices-you-made), if there is a way for a lending platform to bypass any system's restriction, this will be considered a valid finding in the context of this contest.
-
-> Q: Please discuss any design choices you made.
->
-> Notional Exponent is designed to be extendable to new yield strategies and opportunities as well as new lending platforms. If there are ways to bypass the restrictions put in place by our system by the target lending platform (in this case Morpho) or a yield strategy then that may be a valid finding.
-
-Per the contest's README, it mentioned that the invariant is that a whitelisted lending router must first authorize all vault share transfers.
-
-> Q: What properties/invariants do you want to hold even if breaking them has a low/unknown impact?
->
-> All vault share transfers must be first authorized by a whitelisted lending router.
-
-Let's check if a lending platform can transfer yield strategy vault shares without requiring lending router approval, thereby bypassing this restriction and invariant.
-
-It was found that there is a way. In general, the yield strategy vault shares will be deposited in the lending platform as collateral. Thus, the lending platform will hold large amounts of yield strategy shares. The lending platform can call the `AbstractYieldStrategy.redeemNative()`, which will cause all the yield strategy vault shares they hold onto to be burned. Burning tokens is similar to transferring tokens out of an account (e.g., transfer to `address(0)`), in this case.
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/AbstractYieldStrategy.sol#L268
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/single-sided-lp/CurveConvex2Token.sol#L54
 
 ```solidity
-File: AbstractYieldStrategy.sol
-265:     /// @inheritdoc IYieldStrategy
-266:     /// @dev We do not set the current account here because valuation is not done in this method.
-267:     /// A native balance does not require a collateral check.
-268:     function redeemNative(
-269:         uint256 sharesToRedeem,
-270:         bytes memory redeemData
-271:     ) external override nonReentrant returns (uint256 assetsWithdrawn) {
-272:         uint256 sharesHeld = balanceOf(msg.sender);
-273:         if (sharesHeld == 0) revert InsufficientSharesHeld();
-274: 
-275:         assetsWithdrawn = _burnShares(sharesToRedeem, sharesHeld, redeemData, msg.sender);
-276:         ERC20(asset).safeTransfer(msg.sender, assetsWithdrawn);
-277:     }
+File: CurveConvex2Token.sol
+39:     constructor(
+40:         uint256 _maxPoolShare,
+41:         address _asset,
+42:         address _yieldToken,
+43:         uint256 _feeRate,
+44:         address _rewardManager,
+45:         DeploymentParams memory params,
+46:         IWithdrawRequestManager _withdrawRequestManager
+47:     ) AbstractSingleSidedLP(_maxPoolShare, _asset, _yieldToken, _feeRate, _rewardManager, 18, _withdrawRequestManager) {
+48:         CURVE_POOL_TOKEN = ERC20(params.poolToken);
+49: 
+50:         // We interact with curve pools directly so we never pass the token addresses back
+51:         // to the curve pools. The amounts are passed back based on indexes instead. Therefore
+52:         // we can rewrite the token addresses from ALT Eth (0xeeee...) back to (0x0000...) which
+53:         // is used by the vault internally to represent ETH.
+54:         TOKEN_1 = _rewriteAltETH(ICurvePool(params.pool).coins(0));
+55:         TOKEN_2 = _rewriteAltETH(ICurvePool(params.pool).coins(1));
 ```
 
-During the burning of tokens (yield strategy vault share here), the `to` parameter will be `address(0)`. As a result, the restriction at Line 334 below will be bypassed. Thus, even without lending router's approval and even though `t_AllowTransfer_To` and `t_AllowTransfer_Amount` transient variables are not set by the lending routers, the lending platform can still proceed to burn the vault shares and retrieve the underlying yield token. This effectively bypasses the system restriction.
+Assume a Curve pool with the first token is Native ETH, while the second token is a normal ERC20 token (e.g., wstETH). In this case, calling the `TOKENS()` function will return:
 
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/AbstractYieldStrategy.sol#L334
+- tokens[0] = 0x0000 (Native ETH)
+- tokens[1] = 0xB82381A3fBD3FaFA77B3a7bE693342618240067b (wstETH)
+
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/single-sided-lp/CurveConvex2Token.sol#L162
 
 ```solidity
-File: AbstractYieldStrategy.sol
-333:     function _update(address from, address to, uint256 value) internal override {
-334:         if (from != address(0) && to != address(0)) {
-335:             // Any transfers off of the lending market must be authorized here, this means that native balances
-336:             // held cannot be transferred.
-337:             if (t_AllowTransfer_To != to) revert UnauthorizedLendingMarketTransfer(from, to, value);
-338:             if (t_AllowTransfer_Amount < value) revert UnauthorizedLendingMarketTransfer(from, to, value);
-339: 
-340:             delete t_AllowTransfer_To;
-341:             delete t_AllowTransfer_Amount;
-342:         }
-343: 
-344:         super._update(from, to, value);
-345:     }
+File: CurveConvex2Token.sol
+162:     function TOKENS() internal view override returns (ERC20[] memory) {
+163:         ERC20[] memory tokens = new ERC20[](_NUM_TOKENS);
+164:         tokens[0] = ERC20(TOKEN_1);
+165:         tokens[1] = ERC20(TOKEN_2);
+166:         return tokens;
+167:     }
 ```
 
-### Impact
+When computing the value of the Curve LP token, the `getWithdrawRequestValue()` function will attempt to loop through all tokens in Line 326 below.
 
-System restrictions can be bypassed, and the invariant is broken. Per Sherlock's judging rule, breaking an invariant is sufficient to warrant at least a Medium even if the impact is unknown.
-
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-_No response_
-
-# Issue M-20: Unable to increase collateral value leading to position being liquidated 
-
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/728 
-
-## Found by 
-xiaoming90
-
-### Summary
-
--
-
-### Root Cause
-
--
-
-### Internal Pre-conditions
-
--
-
-### External Pre-conditions
-
--
-
-### Attack Path
-
-When the price of underlying yield tokens backing the yield strategy shares gradually decreases over time due to certain unfavorable market conditions, the collateral value of the user's positions will also decrease. In this case, the users need to top-up their collateral value to prevent being liquidated. Note that users will always want to avoid liquidation due to the loss incurred from the liquidation fee or incentive given to the liquidators, and they can only recover a portion of their assets after liquidation.
-
-In order to do so, users can call `Router.enterPosition()` function to mint more yield strategy shares to be deposited as collateral to their position to increase its collateral value.
-
-However, the problem is that this does not work for position that uses Pendle PT-related yield strategy shares as collateral. 
-
-After the Pendle PT has matured, there is no way to mint new yield token (Pendle PT) as shown in Line 63 below. Thus, after maturity, there is no way for the users to top-up the collateral value of their positions.
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/staking/PendlePT.sol#L63
-
-```solidity
-File: PendlePT.sol
-58:     function _mintYieldTokens(
-59:         uint256 assets,
-60:         address /* receiver */,
-61:         bytes memory data
-62:     ) internal override {
-63:         require(!PT.isExpired(), "Expired");
-64: 
-65:         PendleDepositParams memory params = abi.decode(data, (PendleDepositParams));
-66:         uint256 tokenInAmount;
-```
-
-After the PT has matured, the PT rate at the Pendle protocol is fixed at 1:1 (1 PT = 1 Asset). However, that does not mean that the price of the yield strategy is fixed or will not change after maturity. Assume that after maturity, 1 PT is worth exactly 1 WETH. Here, the price of WETH continues to fluctuate based on market conditions.
-
-As shown in Line 144 below, the price of the yield strategy shares is calculated based on the current USD price of yield token and asset token (e.g., USDC). If the price of either WETH or USDC moves, the price of the yield strategy share will move too.
-
-In short, the price of yield strategy shares can decrease after PT has matured. Thus, there must be a way for user to top-up their position's collateral value even after PT has matured.
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/AbstractYieldStrategy.sol#L144
-
-```solidity
-File: AbstractYieldStrategy.sol
-118:     function price() public view override returns (uint256) {
-119:         return convertToAssets(SHARE_PRECISION) * (10 ** (36 - 24)); // @audit-info SHARE_PRECISION => 1e24
-120:     }
-121: 
-122:     /// @inheritdoc IYieldStrategy
-123:     function price(address borrower) external override returns (uint256) {
-124:         // Do not change the current account in this method since this method is not
-125:         // authenticated and we do not want to have any unexpected side effects.
-126:         address prevCurrentAccount = t_CurrentAccount;
-127: 
-128:         t_CurrentAccount = borrower;
-129:         uint256 p = convertToAssets(SHARE_PRECISION) * (10 ** (36 - 24));
-130: 
-131:         t_CurrentAccount = prevCurrentAccount;
-132:         return p;
-133:     }
-..SNIP..
-471:     function convertToAssets(uint256 shares) public view virtual override returns (uint256) {
-472:         uint256 yieldTokens = convertSharesToYieldToken(shares);
-473:         // NOTE: rounds down on division
-474:         return (yieldTokens * convertYieldTokenToAsset() * (10 ** _assetDecimals)) /
-475:             (10 ** (_yieldTokenDecimals + DEFAULT_DECIMALS));
-476:     }
-..SNIP..
-141:     function convertYieldTokenToAsset() public view returns (uint256) {
-142:         // The trading module always returns a positive rate in 18 decimals so we can safely
-143:         // cast to uint256
-144:         (int256 rate , /* */) = TRADING_MODULE.getOraclePrice(yieldToken, asset);
-145:         return uint256(rate);
-146:     }
-```
-
-### Impact
-
-Liquidation will result in a loss for users due to the liquidation fee, and they can only recover a portion of their assets after the liquidation.
-
-Due to this issue, user will be unable to increase the collateral value of their positions, leading to their position being liquidated.
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-_No response_
-
-# Issue M-21: No slippage control during migration 
-
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/774 
-
-## Found by 
-xiaoming90
-
-### Summary
-
--
-
-### Root Cause
-
--
-
-### Internal Pre-conditions
-
--
-
-### External Pre-conditions
-
--
-
-### Attack Path
-
-**Instance 1 - Exiting Position**
-
-During migration, the `redeemData` will be set to `bytes("")` when exiting the existing positions in the previous router in Line 237 below.
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/routers/AbstractLendingRouter.sol#L237
-
-```solidity
-File: AbstractLendingRouter.sol
-222:     function _enterOrMigrate(
-223:         address onBehalf,
-224:         address vault,
-225:         address asset,
-226:         uint256 assetAmount,
-227:         bytes memory depositData,
-228:         address migrateFrom // @audit-info migrateFrom is confirmed a valid LendingRouter, NOT malicious one
-229:     ) internal returns (uint256 sharesReceived) {
-230:         if (migrateFrom != address(0)) {
-231:             // Allow the previous lending router to repay the debt from assets held here.
-232:             ERC20(asset).checkApprove(migrateFrom, assetAmount);
-233:             sharesReceived = ILendingRouter(migrateFrom).balanceOfCollateral(onBehalf, vault);
-234: 
-235:             // Must migrate the entire position
-236:             ILendingRouter(migrateFrom).exitPosition(
-237:                 onBehalf, vault, address(this), sharesReceived, type(uint256).max, bytes("")
-238:             );
-```
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/routers/AbstractLendingRouter.sol#L108
-
-```solidity
-File: AbstractLendingRouter.sol
-108:     function exitPosition(
-109:         address onBehalf,
-110:         address vault,
-111:         address receiver, // @audit if migrate => New LendingRouter
-112:         uint256 sharesToRedeem, // @audit if migrate => ILendingRouter(migrateFrom-oldLendingRouter).balanceOfCollateral(onBehalf, vault);
-113:         uint256 assetToRepay, // @audit if migrate => type(uint256).max
-114:         bytes calldata redeemData // @audit if migrate => empty
-115:     ) external override isAuthorized(onBehalf, vault) {
-```
-
-The `redeemData` will eventually be passed into the following two (2) functions, depending on the setup:
-
-1. `AbstractSingleSidedLP._redeemShares()`
-2. `Abstract.StakingStrategy._redeemShares()`
-
-Within the `AbstractSingleSidedLP._redeemShares()` function, the redeem data is required for slippage control in Line 166 and Line 176 below. If it is not defined, slippage control will be disabled.
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/single-sided-lp/AbstractSingleSidedLP.sol#L145
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/single-sided-lp/AbstractSingleSidedLP.sol#L326
 
 ```solidity
 File: AbstractSingleSidedLP.sol
-145:     function _redeemShares(
-146:         uint256 sharesToRedeem,
-147:         address sharesOwner,
-148:         bool isEscrowed, // @audit-info True if there is pending withdraw request
-149:         bytes memory redeemData
-150:     ) internal override {
-151:         RedeemParams memory params = abi.decode(redeemData, (RedeemParams));
-152: 
-153:         // Stores the amount of each token that has been withdrawn from the pool.
-154:         uint256[] memory exitBalances;
-155:         bool isSingleSided;
-156:         ERC20[] memory tokens;
-157:         if (isEscrowed) {
-158:             // Attempt to withdraw all pending requests, tokens may be different if there
-159:             // is a withdraw request.
-160:             (exitBalances, tokens) = _withdrawPendingRequests(sharesOwner, sharesToRedeem);
-161:             // If there are pending requests, then we are not single sided by definition
-162:             isSingleSided = false;
-163:         } else {
-164:             isSingleSided = params.redemptionTrades.length == 0;
-165:             uint256 yieldTokensBurned = convertSharesToYieldToken(sharesToRedeem);
-166:             exitBalances = _unstakeAndExitPool(yieldTokensBurned, params.minAmounts, isSingleSided);
-167:             tokens = TOKENS();
-168:         }
-169: 
-170:         if (!isSingleSided) {
-171:             // If not a single sided trade, will execute trades back to the primary token on
-172:             // external exchanges. This method will execute EXACT_IN trades to ensure that
-173:             // all of the balance in the other tokens is sold for primary.
-174:             // Redemption trades are not automatically enabled on vaults since the trading module
-175:             // requires explicit permission for every token that can be sold by an address.
-176:             _executeRedemptionTrades(tokens, exitBalances, params.redemptionTrades);
-177:         }
-178:     }
+319:     function getWithdrawRequestValue(
+320:         address account,
+321:         address asset,
+322:         uint256 shares
+323:     ) external view returns (uint256 totalValue) {
+324:         ERC20[] memory tokens = TOKENS();
+325: 
+326:         for (uint256 i; i < tokens.length; i++) {
+327:             IWithdrawRequestManager manager = ADDRESS_REGISTRY.getWithdrawRequestManager(address(tokens[i]));
+328:             // This is called as a view function, not a delegate call so use the msg.sender to get
+329:             // the correct vault address
+330:             (bool hasRequest, uint256 value) = manager.getWithdrawRequestValue(msg.sender, account, asset, shares);
+331:             // Ensure that this is true so that we do not lose any value.
+332:             require(hasRequest);
+333:             totalValue += value;
+334:         }
+335:     }
 ```
 
-Within the `Abstract.StakingStrategy._redeemShares()` function, the redeem data is required for slippage control in Line 100 and Line 115 below. If it is not defined, slippage control will be disabled.
-
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/staking/AbstractStakingStrategy.sol#L82
+In the first iteration, where `tokens[0] = 0x0000 (Native ETH)`, it will execute the following code at Line 327:
 
 ```solidity
-File: AbstractStakingStrategy.sol
-082:     function _redeemShares(
-083:         uint256 sharesToRedeem,
-084:         address sharesOwner,
-085:         bool isEscrowed,
-086:         bytes memory redeemData
-087:     ) internal override {
-088:         if (isEscrowed) {
-089:             (WithdrawRequest memory w, /* */) = withdrawRequestManager.getWithdrawRequest(address(this), sharesOwner);
-090:             uint256 yieldTokensBurned = uint256(w.yieldTokenAmount) * sharesToRedeem / w.sharesAmount;
-091: 
-092:             (uint256 tokensClaimed, bool finalized) = withdrawRequestManager.finalizeAndRedeemWithdrawRequest({
-093:                 account: sharesOwner, withdrawYieldTokenAmount: yieldTokensBurned, sharesToBurn: sharesToRedeem
-094:             });
-095:             if (!finalized) revert WithdrawRequestNotFinalized(w.requestId);
-096: 
-097:             // Trades may be required here if the borrowed token is not the same as what is
-098:             // received when redeeming.
-099:             if (asset != withdrawToken) {
-100:                 RedeemParams memory params = abi.decode(redeemData, (RedeemParams));
-101:                 Trade memory trade = Trade({
-102:                     tradeType: TradeType.EXACT_IN_SINGLE,
-103:                     sellToken: address(withdrawToken),
-104:                     buyToken: address(asset),
-105:                     amount: tokensClaimed,
-106:                     limit: params.minPurchaseAmount,
-107:                     deadline: block.timestamp,
-108:                     exchangeData: params.exchangeData
-109:                 });
-110: 
-111:                 _executeTrade(trade, params.dexId);
-112:             }
-113:         } else {
-114:             uint256 yieldTokensBurned = convertSharesToYieldToken(sharesToRedeem);
-115:             _executeInstantRedemption(yieldTokensBurned, redeemData);
-116:         }
-117:     }
+IWithdrawRequestManager manager = ADDRESS_REGISTRY.getWithdrawRequestManager(address(tokens[i]));
+IWithdrawRequestManager manager = ADDRESS_REGISTRY.getWithdrawRequestManager(address(0));
 ```
 
-In summary, when exiting the existing positions during the migration process, users will suffer slippage and vulnerable to sandwich/MEV attack.
+It will attempt to fetch the Withdraw Request Manager for Native ETH (0x0).
 
-**Instance 2 - Deposit to new Router**
+However, it will revert because there is no Withdraw Request Manager (WRM) for Native ETH. There is only WRM for Standard ERC20, but not Native ETH.
 
-A similar issue also occurs in Line 76, where the `depositData` is set to `bytes("")`. This means that slippage is disabled during depositing, staking, and minting of yield tokens.
+The `BaseLPLib.hasPendingWithdrawals()` function is also affected by the same issue when looping through all the tokens to obtain the WRM.
 
-https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/routers/AbstractLendingRouter.sol#L76
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/single-sided-lp/AbstractSingleSidedLP.sol#L338
 
 ```solidity
-File: AbstractLendingRouter.sol
-66:     /// @inheritdoc ILendingRouter
-67:     function migratePosition(
-68:         address onBehalf,
-69:         address vault,
-70:         address migrateFrom
-71:     ) public override isAuthorized(onBehalf, vault) {
-72:         if (!ADDRESS_REGISTRY.isLendingRouter(migrateFrom)) revert InvalidLendingRouter();
-73:         // Borrow amount is set to the amount of debt owed to the previous lending router
-74:         (uint256 borrowAmount, /* */, /* */) = ILendingRouter(migrateFrom).healthFactor(onBehalf, vault);
-75: 
-76:         _enterPosition(onBehalf, vault, 0, borrowAmount, bytes(""), migrateFrom);
-77:     }
+File: AbstractSingleSidedLP.sol
+338:     function hasPendingWithdrawals(address account) external view override returns (bool) {
+339:         ERC20[] memory tokens = TOKENS();
+340:         for (uint256 i; i < tokens.length; i++) {
+341:             IWithdrawRequestManager manager = ADDRESS_REGISTRY.getWithdrawRequestManager(address(tokens[i]));
+342:             if (address(manager) == address(0)) continue;
+343:             // This is called as a view function, not a delegate call so use the msg.sender to get
+344:             // the correct vault address
+345:             (WithdrawRequest memory w, /* */) = manager.getWithdrawRequest(msg.sender, account);
+346:             if (w.requestId != 0) return true;
+347:         }
+348: 
+349:         return false;
+350:     }
 ```
+
+Same for `BaseLPLib.initiateWithdraw()`, `BaseLPLib.finalizeAndRedeemWithdrawRequest()`, `BaseLPLib.tokenizeWithdrawRequest()`.
 
 ### Impact
 
-High. Loss of funds as users will suffer slippage and vulnerable to sandwich/MEV attack.
+High. This issue is aggravated by the fact that the protocol is designed to handle depositing Native ETH to Curve pool, but the problem will surface during withdrawal and liquidation. In the worst-case scenario, users deposit funds into the protocol but are unable to withdraw them, resulting in their funds being stuck.
+
+Additionally, core functionality is broken, as Curve Pool with Native ETH will not work with the protocol. 
+
 
 ### PoC
 
@@ -3848,7 +4539,7 @@ _No response_
 
 _No response_
 
-# Issue M-22: Convex cannot be configured for the Yield Strategy vault in Arbitrum even though Convex is available in Arbitrum 
+# Issue M-24: Convex cannot be configured for the Yield Strategy vault in Arbitrum even though Convex is available in Arbitrum 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/775 
 
@@ -3931,86 +4622,154 @@ _No response_
 
 _No response_
 
-# Issue M-23: Incorrect Bad Debt Tracking After Full Liquidation in Lending Router 
+# Issue M-25: Revert in `getWithdrawRequestValue()` function will brick the account 
 
-Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/803 
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/779 
 
 ## Found by 
-OSSecurity, godwinudo
+xiaoming90
 
 ### Summary
 
-The `AbstractLendingRouter` does not correctly track or enforce repayment of bad debt after a user's position is fully liquidated. When a user is liquidated and their collateral is exhausted, any remaining debt is socialized by the underlying lending protocol (Morpho), but the router clears the user's position and allows them to re-enter with no restriction or requirement to repay previously socialized debt. This results in unexpected behavior and a lack of accountability for insolvent accounts.
+-
 
 ### Root Cause
 
-After full liquidation, the router calls [`ADDRESS_REGISTRY.clearPosition`](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/82c87105f6b32bb362d7523356f235b5b07509f9/notional-v4/src/routers/AbstractLendingRouter.sol#L169), removing all record of the user's previous debt. There is no mechanism in the router to prevent a user from opening a new position without repaying bad debt that was socialized by Morpho. The router's logic assumes the account starts fresh, which is inconsistent with the expectation that insolvent accounts should not be able to re-enter without settling prior obligations.
+- Revert can occur in `getWithdrawRequestValue()` function, which the critical `price()` function depends on, due to a lack of proper error handling.
+- Incorrect assumption that the exit balance will never be zero under any circumstances.
 
 ### Internal Pre-conditions
 
-- The user's position is fully liquidated, resulting in zero collateral.
-- The router clears the user's position in its local accounting.
-- No additional tracking or enforcement of bad debt is performed by the router.
+-
 
 ### External Pre-conditions
 
-- Morpho socializes any remaining debt, reducing supply assets for all suppliers and setting the user's `borrowShares` to zero.
+-
 
 ### Attack Path
 
-1. A user is liquidated and their position is cleared in the router.
-2. Any remaining debt is socialized by Morpho and not tracked by the router.
-3. The user can re-enter a new position without repaying previously socialized debt, effectively escaping accountability for insolvency.
+**Main Issue**
+
+It was found that when computing the value of the withdraw request, it will attempt to loop through all Cruve's pool tokens and check if there is a withdraw request for the current token. If not, the transaction will revert in Line 332 below.
+
+The issue is that if it is ever possible to cause a revert in Line 332, it will be a serious issue because Morpho can no longer fetch the price. The Notional's `price()` relies on the `getWithdrawRequestValue()` function. If the `price()` reverts when Morpho is reading it, the affected account's position will be stuck forever, as none of the operations (exit position, repay debt, withdraw collateral, liquidation) can be performed.
+
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/single-sided-lp/AbstractSingleSidedLP.sol#L332
+
+```solidity
+File: AbstractSingleSidedLP.sol
+319:     function getWithdrawRequestValue(
+320:         address account,
+321:         address asset,
+322:         uint256 shares
+323:     ) external view returns (uint256 totalValue) {
+324:         ERC20[] memory tokens = TOKENS();
+325: 
+326:         for (uint256 i; i < tokens.length; i++) {
+327:             IWithdrawRequestManager manager = ADDRESS_REGISTRY.getWithdrawRequestManager(address(tokens[i]));
+328:             // This is called as a view function, not a delegate call so use the msg.sender to get
+329:             // the correct vault address
+330:             (bool hasRequest, uint256 value) = manager.getWithdrawRequestValue(msg.sender, account, asset, shares);
+331:             // Ensure that this is true so that we do not lose any value.
+332:             require(hasRequest);
+333:             totalValue += value;
+334:         }
+335:     }
+```
+
+Let's review if there is a possibility where the revert in Line 332 can be triggered.
+
+It was found that it is possible under certain conditions. If the exit balance of one of the tokens is zero, no withdraw request will be created for that specific token, as shown in Line 362. Creation of the withdraw request will be skipped.
+
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/single-sided-lp/AbstractSingleSidedLP.sol#L363
+
+```solidity
+File: AbstractSingleSidedLP.sol
+353:     function initiateWithdraw(
+354:         address account,
+355:         uint256 sharesHeld,
+356:         uint256[] calldata exitBalances,
+357:         bytes[] calldata withdrawData
+358:     ) external override returns (uint256[] memory requestIds) {
+359:         ERC20[] memory tokens = TOKENS();
+360: 
+361:         requestIds = new uint256[](exitBalances.length);
+362:         for (uint256 i; i < exitBalances.length; i++) {
+363:             if (exitBalances[i] == 0) continue;
+364:             IWithdrawRequestManager manager = ADDRESS_REGISTRY.getWithdrawRequestManager(address(tokens[i]));
+365: 
+366:             tokens[i].checkApprove(address(manager), exitBalances[i]);
+367:             // Will revert if there is already a pending withdraw
+368:             requestIds[i] = manager.initiateWithdraw({
+369:                 account: account,
+370:                 yieldTokenAmount: exitBalances[i],
+371:                 sharesAmount: sharesHeld,
+372:                 data: withdrawData[i]
+373:             });
+374:         }
+375:     }
+```
+
+Thus, the current implementation will only work if there is an assumption or invariant that the exit balance of any tokens can never be zero under any circumstances.
+
+However, this assumption and the invariant do not hold at all times due to the following reasons:
+
+1. If users have almost entirely swapped out one token, leaving its balance nearly or exactly zero, then proportional withdrawal will result in zero for that token. If it is near zero or an extremely small amount, the returned token amount might round down to zero.
+2. Notional does not enforce a minimum position size. Thus, if the position is tiny, the LP token to be exited will be tiny, and withdrawal for a given token can round down to zero. Tokens with small decimal precision (e.g, USDC=6, WBTC=8) are more susceptible to this rounding problem.
+3. After a major “depeg event” or manipulation, one token could be totally depleted
 
 ### Impact
 
-- Insolvent users can repeatedly open new positions without ever repaying bad debt, increasing systemic risk and undermining the integrity of the protocol.
-- Honest suppliers bear the cost of socialized bad debt, while insolvent users face no restrictions or consequences.
-- This behavior may be exploited to repeatedly extract value from the protocol.
+Funds are being stuck as shown in the scenario above.
 
 ### PoC
 
-Add the following PoC to `/tests/TestMorphoYieldStrategy.sol`:
-
-```solidity
-    function test_badDebtTracking_poc() public {
-        address user = msg.sender;
-        uint256 depositAmount = defaultDeposit;
-        uint256 borrowAmount = defaultBorrow;
-
-        // User enters a leveraged position
-        _enterPosition(user, depositAmount, borrowAmount);
-
-        // Simulate price drop to trigger liquidation
-        int256 originalPrice = o.latestAnswer();
-        o.setPrice(originalPrice * 0.5e18 / 1e18); // 50% price drop
-
-        // Liquidator liquidates the user, seizing all collateral
-        address liquidator = makeAddr("liquidator");
-        vm.prank(owner);
-        asset.transfer(liquidator, depositAmount + borrowAmount);
-
-        vm.startPrank(liquidator);
-        asset.approve(address(lendingRouter), type(uint256).max);
-        uint256 sharesToLiquidate = lendingRouter.balanceOfCollateral(user, address(y));
-        lendingRouter.liquidate(user, address(y), sharesToLiquidate, 0);
-        vm.stopPrank();
-
-        // User's position is now cleared
-        assertEq(lendingRouter.balanceOfCollateral(user, address(y)), 0, "User position should be cleared");
-
-        // User re-enters a new position with fresh collateral and borrow
-        _enterPosition(user, depositAmount, 1);
-
-        // Assert that user was able to re-enter without restriction
-        assertGt(
-            lendingRouter.balanceOfCollateral(user, address(y)), 0, "User should be able to re-enter after liquidation"
-        );
-    }
-```
+_No response_
 
 ### Mitigation
 
-- Implement logic in the router to track insolvent accounts and prevent them from opening new positions until previously socialized debt is repaid, as stated in code comments.
-- Add checks to ensure that users with a history of bad debt cannot re-enter without settling prior obligations.
+_No response_
+
+# Issue M-26: `initializeMarket` can be frontran, preventing markets from being configured in `MorphoLendingRouter ` 
+
+Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/834 
+
+## Found by 
+0xBoraichoT, 0xPhantom2, 0xRstStn, 0xodus, 0xpiken, Hueber, Ragnarok, X0sauce, coffiasd, dan\_\_vinci, patitonar, underdog, xiaoming90, y4y
+
+### Summary
+
+`initializeMarket` can be frontran, creating the same morpho market as the expected when initializing. 
+
+### Root Cause
+
+In [MorphoLendingRouter.sol#L51](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/routers/MorphoLendingRouter.sol#L51), the router will try to initialize a market for a certain market params configuration. Note that `initializeMarket` is the only way to store data for the vault in the corresponding `s_morphoParams` mapping, and it is critical that this mapping is written to, as `marketParams()` wwill [fetch some of the data from the stored mapping(https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/routers/MorphoLendingRouter.sol#L59), and this function is [used across the whole router contract](https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/src/routers/MorphoLendingRouter.sol#L77).
+
+The problem is that anybody can frontrun the initialization by directly calling morpho's `createMarket()` function, creating the same market. After that, the initialization will fail because Morpho [ensures that the same market can only be created once](https://etherscan.io/address/0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb#code#F1#L154). Because of this, markets initializations will be dos'ed, and the router won't be usable for the corresponding vault with the desired market params.
+
+### Internal Pre-conditions
+
+None.
+
+### External Pre-conditions
+
+None.
+
+### Attack Path
+
+1. `upgradeAdmin` calls `initializeMarket`
+2. Malicious user frontruns the call, calling Morpho's `createMarket` with the same market params as the initialization.
+3. `initializeMarket` fails due to the [check in market creation](https://etherscan.io/address/0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb#code).
+
+### Impact
+
+Medium, it is possible to DoS market initialization, which will prevent storing the corresponding market for the given vault, preventing such vault from being used. 
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+Consider implementing a `try/catch` statement. If the market creation fails, it will mean the market was already created, allowing configuration to still be performed
 
