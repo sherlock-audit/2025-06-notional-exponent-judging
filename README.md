@@ -596,6 +596,16 @@ The "before balance" state accounting hould be captured **after** the `_preStaki
     
 ```
 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/34
+
+
+
+
 # Issue H-2: Attacker can drain the entire suppliers on Morpho market by inflating collateral price 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/214 
@@ -784,6 +794,21 @@ Logs:
 ### Mitigation
 
 tbd
+
+## Discussion
+
+**jeffywu**
+
+Fix is to disable borrowing directly from Morpho altogether:
+https://github.com/notional-finance/notional-v4/pull/10/files\#diff-2ac57114dd95cd7f2ec36fb64d9895e7ac22e0f702c03de327ed3cead58642f8R130
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/10/files\#diff-2ac57114dd95cd7f2ec36fb64d9895e7ac22e0f702c03de327ed3cead58642f8R130
+
+
+
 
 # Issue H-3: `DineroWithdrawRequestManager` vulnerable to token overwithdrawal via batch ID overlap 
 
@@ -1031,6 +1056,21 @@ Logs:
 
 tbd
 
+## Discussion
+
+**jeffywu**
+
+The fix removes the ability to borrow from Morpho directly:
+https://github.com/notional-finance/notional-v4/pull/10/files\#diff-2ac57114dd95cd7f2ec36fb64d9895e7ac22e0f702c03de327ed3cead58642f8R130
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/10/files\#diff-2ac57114dd95cd7f2ec36fb64d9895e7ac22e0f702c03de327ed3cead58642f8R130
+
+
+
+
 # Issue H-5: `migrateRewardPool` Fails Due to Incompatible Storage Design in `CurveConvexLib` 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/485 
@@ -1078,6 +1118,15 @@ _No response_
 ### Mitigation
 
 Create a migration logic for `CurveConvex2Token` where reward pool can be migrated from one to another
+
+## Discussion
+
+**jeffywu**
+
+Migrations to a new reward pool require an upgrade to the contract. See this corresponding test:
+https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v4/tests/TestRewardManager.sol\#L63
+
+
 
 # Issue H-6: DoS might happen to `DineroWithdrawRequestManager#_initiateWithdrawImpl()` due to overflow on `++s_batchNonce` 
 
@@ -1353,6 +1402,8 @@ https://github.com/notional-finance/notional-v4/pull/16/files
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/689 
 
+This issue has been acknowledged by the team but won't be fixed at this time.
+
 ## Found by 
 mstpr-brainbot, xiaoming90
 
@@ -1509,6 +1560,18 @@ _No response_
 ### Mitigation
 
 _No response_
+
+## Discussion
+
+**T-Woodward**
+
+This is an issue that will be managed through proper parameter choices, not code.
+
+All SY tokens give you the option to redeem to a matching token (i.e. rsETH SY -> rsETH). If redeeming to the matching token, there will not be a fee or a trade and one SY will equal one yield token.
+
+So we'll just make sure to always redeem to the matching token and double check the SY's redemption function when we list new vaults.
+
+
 
 # Issue H-9: Hardcoded `useEth = true` in `remove_liquidity_one_coin` or `remove_liquidity` lead to stuck fund 
 
@@ -1728,6 +1791,16 @@ _No response_
 For exiting pool code, update the code to only set `useEth` to `True` if `TOKEN_1` or `TOKEN_2` is equal to `ETH_ADDRESS`(0x0). Otherwise, `useEth` should be `False`.
 
 In this scenario, `useEth` should be `false` when exiting the pool. If it is set to `false` in the first place, WETH will be forwarded to the YS vault, and everything will work as expected without error.
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/26/files
+
+
+
 
 # Issue H-10: Malicious user can change the `TradeType` to steal funds from the vault or withdraw request manager 
 
@@ -1957,6 +2030,8 @@ https://github.com/notional-finance/notional-v4/pull/18
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/874 
 
+This issue has been acknowledged by the team but won't be fixed at this time.
+
 ## Found by 
 0xPhantom2, Bluedragon, Schnilch, albahaca0000, boredpukar, jasonxiale, sergei2340, touristS, xiaoming90, yoooo, zhuying
 
@@ -2028,9 +2103,23 @@ function redeemExpiredPT(
 }
 ```
 
+## Discussion
+
+**T-Woodward**
+
+This is an issue that will be managed through proper parameter choices, not code.
+
+All SY tokens give you the option to redeem to a matching token (i.e. rsETH SY -> rsETH). If redeeming to the matching token, there will not be a fee or a trade and setting minTokenOut to 0 is fine.
+
+So we'll just make sure to always redeem to the matching token and double check the SY's redemption function.
+
+
+
 # Issue M-1: Hard-Coded Mainnet WETH Address Breaks All Non-Mainnet Deployments 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/195 
+
+This issue has been acknowledged by the team but won't be fixed at this time.
 
 ## Found by 
 0xShoonya, boredpukar, talfao, vangrim
@@ -2075,6 +2164,14 @@ Make `WETH` an immutable constructor argument or pull it from `AddressRegistry`.
 At deployment, assert `address(WETH).code.length > 0`.
 
 
+
+
+
+## Discussion
+
+**jeffywu**
+
+This will be fixed when we deploy to other chains.
 
 
 
@@ -2233,6 +2330,21 @@ _No response_
 
 Remove the WETH.withdraw since the ETH is received natively to yield strategy
 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/26
+
+
+**jeffywu**
+
+Actually looking closer at this issue, it's unlikely that this scenario would ever occur in practice. This would require that we borrow some token and then trade it into ETH for a ETH/<some other token> pool. Generally speaking, there will be insufficient lending liquidity for any token paired with ETH. To enter into such a pool you would almost certainly already be borrowing ETH and you would never trade into ETH. 
+
+
+
+
 # Issue M-4: Liquidations can be frontrunned to avoid by paying as little as 1 share. 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/300 
@@ -2374,9 +2486,21 @@ _No response_
 
 Do not allow CURVE_V2 if "asset" token trade.pool is the same. For CURVE_V2 multiple swaps it could be a problem to check each pool but I guess thats not the case since the router has the one doing the swaps not the strategy. 
 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/32
+
+
+
+
 # Issue M-6: Withdrawals ongoing for OETH, apxETH, weETH, and almost any LST are overpriced by the oracle 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/322 
+
+This issue has been acknowledged by the team but won't be fixed at this time.
 
 ## Found by 
 0xpiken, mstpr-brainbot, xiaoming90
@@ -2441,6 +2565,16 @@ _No response_
 ### Mitigation
 
 For LST's override the `getWithdrawRequestValue` function
+
+## Discussion
+
+**T-Woodward**
+
+Valuation inaccuracy is negligible here.
+
+A fix for a different issue disables borrowing directly from Morpho - that will fully neuter any threat due to this issue. Users won't be able to take advantage of a higher collateral value by borrowing directly from Morpho or borrowing through Notional because their Notional tx would revert due to an existing withdrawal request. Finally, if a user should be eligible for liquidation based on their "true" collateral value, but is not currently, anyone can call finalizeRequestManual which will switch over their valuation methodology to the true value.
+
+
 
 # Issue M-7: Rounding discrepancy between `MorphoLendingRouter::healthFactor` and `Morpho::repay` causes position migration failures 
 
@@ -2818,6 +2952,16 @@ _No response_
 
 instead of checking effective supply against "0" check against VIRTUAL_SHARES or use totalSupply.
 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/27
+
+
+
+
 # Issue M-9: OETH Strategy Broken as Rebasing Not Enabled 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/538 
@@ -3000,11 +3144,19 @@ function _executeRedemptionTrades(
 }
 ```
 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/26/files
+
+
+
+
 # Issue M-11: Users unable to claim rewards when Curve LP tokens are staked to Curve Gauge. 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/595 
-
-This issue has been acknowledged by the team but won't be fixed at this time.
 
 ## Found by 
 Bluedragon, Riceee, bretzel, touristS, xiaoming90
@@ -3036,6 +3188,16 @@ https://github.com/sherlock-audit/2025-06-notional-exponent/blob/main/notional-v
 
 ### Mitigation
 When rewardPool == address(0), i.e., the strategy uses Gauge, instead of shortcircuiting, implement logic to claim rewards from the Gauge contract.
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/28
+
+
+
 
 # Issue M-12: `PendlePTOracle._getPTRate` isn't correct for some market 
 
@@ -3117,6 +3279,16 @@ _No response_
 ### Mitigation
 
 _No response_
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/29
+
+
+
 
 # Issue M-13: Incompatibility of `ERC20::approve` function with USDT tokens on Ethereum Mainnet chain 
 
@@ -3386,9 +3558,21 @@ _No response_
 
 _No response_
 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/36
+
+
+
+
 # Issue M-15: Loss of reward tokens during initiating withdrawal due to cooldown 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/669 
+
+This issue has been acknowledged by the team but won't be fixed at this time.
 
 ## Found by 
 0xDeoGratias, Bigsam, crunter, touristS, xiaoming90, yaractf
@@ -3558,9 +3742,19 @@ _No response_
 
 During initiating withdrawal, the cooldown should not be applicable and the claiming of reward tokens from the external protocol must always occur. This ensures that the `accumulatedRewardPerVaultShare` is updated to the latest state before Bob claims his reward for the last time.
 
+## Discussion
+
+**jeffywu**
+
+Won't fix, this is the design of the system and any loss would be considered marginal.
+
+
+
 # Issue M-16: Users will be unfairly liquidated if collateral value drops after initiating withdraw request 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/673 
+
+This issue has been acknowledged by the team but won't be fixed at this time.
 
 ## Found by 
 xiaoming90
@@ -3621,6 +3815,14 @@ _No response_
 ### Mitigation
 
 _No response_
+
+## Discussion
+
+**jeffywu**
+
+This is not true. The user can repay their debt directly on Morpho.
+
+
 
 # Issue M-17: User unable to migrate under certain edge case 
 
@@ -3776,6 +3978,8 @@ https://github.com/notional-finance/notional-v4/pull/9
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/677 
 
+This issue has been acknowledged by the team but won't be fixed at this time.
+
 ## Found by 
 xiaoming90
 
@@ -3857,9 +4061,19 @@ _No response_
 
 _No response_
 
+## Discussion
+
+**T-Woodward**
+
+Not a useful comment. The same could be said of any token. The risk is higher here due to a hardcoded dex, but it is a known and understood risk. Furthermore, users can wait until PT maturity to exit via unstaking their sUSDe and avoiding the dex altogether.
+
+
+
 # Issue M-19: Unable to deposit to Convex in Arbitrum 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/678 
+
+This issue has been acknowledged by the team but won't be fixed at this time.
 
 ## Found by 
 dan\_\_vinci, elolpuer, khaye26, xiaoming90
@@ -3960,9 +4174,19 @@ function _stakeLpTokens(uint256 lpTokens) internal {
 }
 ```
 
+## Discussion
+
+**jeffywu**
+
+Won't fix in this version, will fix if deployed to Arbitrum.
+
+
+
 # Issue M-20: Lack of minimum debt threshold enables unliquidatable small positions 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/684 
+
+This issue has been acknowledged by the team but won't be fixed at this time.
 
 ## Found by 
 0xKemah, 0xenzo, Audinarey, EddiePumpin, LhoussainePh, Pro\_King, SOPROBRO, jasonxiale, molaratai, oxwhite, theweb3mechanic
@@ -4064,9 +4288,21 @@ _No response_
 - Enforce a minimum borrow size
 - Or prevent users from leaving behind trivial debt after repay or withdrawal.
 
+## Discussion
+
+**T-Woodward**
+
+Unliquidatable small positions are the underlying lending protocol's problem, not ours. They affect the lending protocol's users (the lenders), not ours (the borrowers).
+
+Guarding against these scenarios is their job, not ours.
+
+
+
 # Issue M-21: Funds stuck if one of the withdrawal requests cannot be finalized 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/692 
+
+This issue has been acknowledged by the team but won't be fixed at this time.
 
 ## Found by 
 HeckerTrieuTien, Ledger\_Patrol, auditgpt, coin2own, dan\_\_vinci, xiaoming90
@@ -4152,6 +4388,18 @@ _No response_
 ### Mitigation
 
 _No response_
+
+## Discussion
+
+**T-Woodward**
+
+Lido-specific issues are not in scope for this audit.
+
+Regarding an external protocol getting compromised - we would have multiple avenues available to get at stuck funds. We could upgrade the impacted vault and/or wrm. For applicable wrms we could also call rescueTokens.
+
+It's not worth the risk of implementing a bunch of complex logic to allow for a user to finalize and redeem one but not both of his withdraw requests.
+
+
 
 # Issue M-22: Setup with `asset = WETH` and a Curve pool that contains Native ETH will lead to a loss for the users 
 
@@ -4398,6 +4646,16 @@ _No response_
 
 _No response_
 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/26/files
+
+
+
+
 # Issue M-23: Unable to support Curve Pool with Native ETH 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/717 
@@ -4539,9 +4797,21 @@ _No response_
 
 _No response_
 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/26/files
+
+
+
+
 # Issue M-24: Convex cannot be configured for the Yield Strategy vault in Arbitrum even though Convex is available in Arbitrum 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/775 
+
+This issue has been acknowledged by the team but won't be fixed at this time.
 
 ## Found by 
 0xRstStn, 0xShoonya, Atharv, Ledger\_Patrol, anchabadze, h2134, holtzzx, jasonxiale, kangaroo, lodelux, theweb3mechanic, xiaoming90
@@ -4621,6 +4891,14 @@ _No response_
 ### Mitigation
 
 _No response_
+
+## Discussion
+
+**T-Woodward**
+
+Won't fix in this version, will fix if deployed to Arbitrum.
+
+
 
 # Issue M-25: Revert in `getWithdrawRequestValue()` function will brick the account 
 
@@ -4730,9 +5008,21 @@ _No response_
 
 _No response_
 
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/notional-finance/notional-v4/pull/23/commits/a809036c2543ba434309374de715a8173b7bf39a
+
+
+
+
 # Issue M-26: `initializeMarket` can be frontran, preventing markets from being configured in `MorphoLendingRouter ` 
 
 Source: https://github.com/sherlock-audit/2025-06-notional-exponent-judging/issues/834 
+
+This issue has been acknowledged by the team but won't be fixed at this time.
 
 ## Found by 
 0xBoraichoT, 0xPhantom2, 0xRstStn, 0xodus, 0xpiken, Hueber, Ragnarok, X0sauce, coffiasd, dan\_\_vinci, patitonar, underdog, xiaoming90, y4y
@@ -4772,4 +5062,14 @@ _No response_
 ### Mitigation
 
 Consider implementing a `try/catch` statement. If the market creation fails, it will mean the market was already created, allowing configuration to still be performed
+
+## Discussion
+
+**jeffywu**
+
+While true, we won't fix this. It's highly unlikely to happen in practice. In the 0.000001\% chance that someone actually does this, we would have to run an upgrade on the LendingRouter to set the parameters as a one off. This would require a 7 day upgrade window but it is not unrecoverable as suggested.
+
+The more likely scenario is to protect against a finger gun where the function is called twice on accident by someone trying to set up a new vault.
+
+
 
